@@ -1,0 +1,17 @@
+[project]
+name = "xauusd100"
+version = "0.2.0"
+description = "MT5-first XAUUSD algo trading lab (live + MT5-history backtest)"
+requires-python = ">=3.11"
+dependencies = [
+  "pandas>=2.0",
+  "numpy>=1.24",
+  "pyyaml>=6.0",
+  "MetaTrader5>=5.0.45",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

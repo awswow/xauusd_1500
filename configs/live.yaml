@@ -1,0 +1,66 @@
+run_name: "live_xauusd_m15"
+
+mt5:
+  login: null
+  password: null
+  server: null
+  path: null
+  timeout_ms: 10000
+
+symbol: "XAUUSD"
+timeframe: "M15"
+
+strategy:
+  name: "pullback_trend"
+  params:
+    atr_len: 14
+    atr_max_points: 9.024109318483198
+    sma_len: 60
+    adx_min: 24.3
+    pullback_atr: 0.3
+    stop_atr: 1.2
+    target_r: 2.0
+
+
+risk:
+  account_usd: 1500
+  risk_per_trade_usd: 10
+  max_daily_loss_usd: 30
+  max_trades_per_day: 2
+  time_stop_bars: 0
+  cooldown_bars: 16
+
+risk_filters:
+  max_stop_points: 1800
+
+
+execution:
+  magic: 100100
+  deviation_points: 30
+  filling_preference: ["FOK", "IOC", "RETURN"]
+  max_spread_points: 45
+  comment: "xauusd100"
+
+trade_windows_utc: ["12:00-17:00", "19:00-22:00"]
+block_windows_utc: ["21:55-22:10"]
+
+reporting:
+  out_dir: "data/derived/runs"
+
+backtest:
+  entry_confirmation: prev_high_break
+  spread_points: 60
+  spread_mode: half
+  spread_source: fixed
+  intrabar_policy: conservative
+
+execution:
+  risk_usd_per_trade: 10
+  daily_loss_limit_usd: 30
+  max_trades_per_day: 2
+  pending_expiry_bars: 4
+  magic: 101001
+  comment: "xauusd100_demo"
+  slippage_points: 50
+  deviation_points: 50
+  dry_run: false
