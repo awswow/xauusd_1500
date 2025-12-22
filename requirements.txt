@@ -2,3 +2,4 @@ pandas>=2.0
 numpy>=1.24
 pyyaml>=6.0
 MetaTrader5>=5.0.45
+aiogram
