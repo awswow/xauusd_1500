@@ -1,4 +1,4 @@
-# xauusd_100
+# xauusd_1500
 
 Systematic MT5 algorithmic trading project for XAUUSD.
 
