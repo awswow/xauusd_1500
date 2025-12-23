@@ -25,10 +25,11 @@ trade_windows_utc: ["00:00-23:59"]
 block_windows_utc: ["21:55-22:10"]
 
 execution:
-  magic: 101002
+  magic: 101003
   comment: "xauusd100_demo"
   slippage_points: 50
   deviation_points: 50
+
   max_spread_points: 45
   pending_expiry_bars: 4
 
@@ -51,4 +52,5 @@ risk_filters:
   tq_adx_min: 15
   tq_adx_rise_bars: 0
   tq_atr_ref_window: 96
-  tq_atr_quantile: 0.20
+  tq_atr_quantile: 0.05
+

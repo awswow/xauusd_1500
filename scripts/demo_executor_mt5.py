@@ -27,6 +27,7 @@ from xauusd100.mt5.symbols import get_symbol_spec
 from xauusd100.strategy.pullback_trend import PullbackTrendStrategy, PullbackTrendParams
 from xauusd100.strategy.base import StrategyContext
 
+
 TF_MAP = {
     "M1": mt5.TIMEFRAME_M1,
     "M5": mt5.TIMEFRAME_M5,
@@ -59,23 +60,27 @@ class ExecCfg:
     daily_loss_limit_usd: float = 30.0
     max_trades_per_day: int = 2
     pending_expiry_bars: int = 4
-    magic: int = 101002
+    magic: int = 101001
     comment: str = "xauusd100_demo"
     slippage_points: int = 50
     deviation_points: int = 50
     dry_run: bool = False
     heartbeat_sec: int = 60
+    # extra safety:
+    max_spread_points: Optional[int] = None
+    entry_buffer_points: int = 2
+    convert_to_market_on_breakout: bool = True
 
 
 @dataclass(frozen=True)
-class RiskFilterCfg:
+class TrendQualityCfg:
     enabled: bool = True
     tq_adx_len: int = 14
     tq_atr_len: int = 14
     tq_adx_min: float = 15.0
     tq_adx_rise_bars: int = 0
-    tq_atr_ref_window: int = 120
-    tq_atr_quantile: float = 0.20
+    tq_atr_ref_window: int = 96
+    tq_atr_quantile: float = 0.10  # PnL-first: less likely to deadlock
 
 
 class CSVLogger:
@@ -149,8 +154,20 @@ def symbol_info_or_raise(symbol: str):
     return info
 
 
+def ensure_symbol_selected(symbol: str) -> bool:
+    """
+    Ensures symbol is visible in Market Watch. Many 'tick missing' / 'rates None' issues
+    are simply symbol not selected.
+    """
+    try:
+        if mt5.symbol_select(symbol, True):
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def symbol_point(symbol: str) -> float:
-    # prefer repo spec, but fall back to MT5 info if needed
     try:
         return float(get_symbol_spec(symbol).point)
     except Exception:
@@ -165,16 +182,6 @@ def symbol_digits(symbol: str) -> int:
 
 def round_to_symbol(symbol: str, price: float) -> float:
     return round(float(price), symbol_digits(symbol))
-
-
-def stops_level_points(symbol: str) -> int:
-    info = symbol_info_or_raise(symbol)
-    return int(getattr(info, "trade_stops_level", 0) or 0)
-
-
-def freeze_level_points(symbol: str) -> int:
-    info = symbol_info_or_raise(symbol)
-    return int(getattr(info, "trade_freeze_level", 0) or 0)
 
 
 def get_tick(symbol: str):
@@ -194,7 +201,7 @@ def spread_points(symbol: str) -> Optional[float]:
 
 
 # ----------------------------
-# Simple indicators for risk_filters gate
+# Indicators for risk filter
 # ----------------------------
 def _true_range(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:
     prev_close = np.roll(close, 1)
@@ -247,104 +254,97 @@ def adx_wilder(high: np.ndarray, low: np.ndarray, close: np.ndarray, n: int) -> 
 
     adx_out = np.full_like(dx, np.nan, dtype=float)
     seed_index = (2 * n) - 1
-    adx_out[seed_index] = float(np.nanmean(dx[n : 2 * n]))
+    adx_out[seed_index] = float(np.nanmean(dx[n:2 * n]))
     for i in range(2 * n, len(dx)):
         adx_out[i] = ((adx_out[i - 1] * (n - 1)) + dx[i]) / float(n)
 
     return adx_out
 
 
-def trend_quality_pass(bars: list[Bar], rf: RiskFilterCfg) -> Tuple[bool, Dict[str, Any]]:
-    if not rf.enabled:
+def trend_quality_gate(
+    bars: list[Bar],
+    cfg: TrendQualityCfg,
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Returns (pass, diag). If blocked, diag includes reason.
+    """
+    if not cfg.enabled:
         return True, {"enabled": False}
 
-    need = max(2 * rf.tq_adx_len + 5, rf.tq_atr_ref_window + rf.tq_atr_len + 5)
+    need = max(2 * cfg.tq_atr_len + 5, cfg.tq_atr_ref_window + cfg.tq_atr_len + 5)
     if len(bars) < need:
-        return False, {"enabled": True, "reason": "warmup", "need": need, "have": len(bars)}
+        return True, {"enabled": True, "reason": "warmup", "need": need, "have": len(bars)}
 
     high = np.array([b.high for b in bars], dtype=float)
     low = np.array([b.low for b in bars], dtype=float)
     close = np.array([b.close for b in bars], dtype=float)
 
-    atr_arr = atr_wilder(high, low, close, rf.tq_atr_len)
-    adx_arr = adx_wilder(high, low, close, rf.tq_adx_len)
+    atr_arr = atr_wilder(high, low, close, int(cfg.tq_atr_len))
+    adx_arr = adx_wilder(high, low, close, int(cfg.tq_adx_len))
 
     if len(atr_arr) == 0 or len(adx_arr) == 0:
-        return False, {"enabled": True, "reason": "indicator_empty"}
+        return True, {"enabled": True, "reason": "indicator_empty"}
 
     atr_now = float(atr_arr[-1]) if np.isfinite(atr_arr[-1]) else None
     adx_now = float(adx_arr[-1]) if np.isfinite(adx_arr[-1]) else None
     if atr_now is None or adx_now is None:
-        return False, {"enabled": True, "reason": "indicator_nan"}
+        return True, {"enabled": True, "reason": "indicator_nan"}
 
-    # ADX minimum
-    if adx_now < float(rf.tq_adx_min):
-        return False, {"enabled": True, "reason": "adx_below_min", "adx_now": adx_now, "min": rf.tq_adx_min}
+    # ADX min gate
+    if adx_now < float(cfg.tq_adx_min):
+        return False, {
+            "enabled": True,
+            "reason": "adx_below_min",
+            "adx_now": adx_now,
+            "adx_min": float(cfg.tq_adx_min),
+        }
 
-    # Optional ADX rising requirement over last N bars
-    rise = int(rf.tq_adx_rise_bars or 0)
-    if rise > 0:
-        idx_prev = max(0, len(adx_arr) - 1 - rise)
-        adx_prev = float(adx_arr[idx_prev]) if np.isfinite(adx_arr[idx_prev]) else None
-        if adx_prev is None or adx_now <= adx_prev:
-            return False, {"enabled": True, "reason": "adx_not_rising", "adx_now": adx_now, "adx_prev": adx_prev, "rise_bars": rise}
+    # Optional "ADX rising" gate
+    rise = int(cfg.tq_adx_rise_bars or 0)
+    if rise > 0 and len(adx_arr) > (rise + 1):
+        prev = float(adx_arr[-(rise + 1)]) if np.isfinite(adx_arr[-(rise + 1)]) else None
+        if prev is not None and adx_now < prev:
+            return False, {
+                "enabled": True,
+                "reason": "adx_not_rising",
+                "adx_now": adx_now,
+                "adx_prev": prev,
+                "rise_bars": rise,
+            }
 
-    # ATR quantile gate (avoid low-vol compression)
-    w = int(rf.tq_atr_ref_window or 120)
-    w = max(20, w)
-    atr_window = atr_arr[-w:]
-    atr_window = atr_window[np.isfinite(atr_window)]
-    if len(atr_window) < max(20, int(0.5 * w)):
-        return False, {"enabled": True, "reason": "atr_ref_insufficient", "have": int(len(atr_window)), "want": w}
+    # ATR quantile gate
+    ref = int(cfg.tq_atr_ref_window)
+    qv = float(cfg.tq_atr_quantile)
+    atr_tail = atr_arr[-ref:] if len(atr_arr) >= ref else atr_arr
+    atr_tail = atr_tail[np.isfinite(atr_tail)]
+    if len(atr_tail) < max(20, ref // 2):
+        # not enough stable samples; don't block
+        return True, {"enabled": True, "reason": "atr_ref_insufficient", "have": int(len(atr_tail)), "ref_window": ref}
 
-    q = float(np.quantile(atr_window, float(rf.tq_atr_quantile)))
+    q = float(np.quantile(atr_tail, qv))
     if atr_now < q:
-        return False, {"enabled": True, "reason": "atr_below_q", "atr_now": atr_now, "q": q, "quantile": rf.tq_atr_quantile, "ref_window": w}
+        return False, {
+            "enabled": True,
+            "reason": "atr_below_q",
+            "atr_now": atr_now,
+            "q": q,
+            "quantile": qv,
+            "ref_window": ref,
+        }
 
-    return True, {"enabled": True, "reason": "pass", "adx_now": adx_now, "atr_now": atr_now, "atr_q": q}
-
-
-# ----------------------------
-# Risk sizing
-# ----------------------------
-def tick_value_and_size(symbol: str) -> Tuple[Optional[float], Optional[float]]:
-    info = mt5.symbol_info(symbol)
-    if info is None:
-        return None, None
-    tick_value = getattr(info, "trade_tick_value", None)
-    tick_size = getattr(info, "trade_tick_size", None)
-    if tick_size in (None, 0):
-        tick_size = getattr(info, "point", None)
-    try:
-        tick_value = float(tick_value) if tick_value is not None else None
-    except Exception:
-        tick_value = None
-    try:
-        tick_size = float(tick_size) if tick_size is not None else None
-    except Exception:
-        tick_size = None
-    return tick_value, tick_size
-
-
-def calc_lot_for_risk(symbol: str, entry: float, stop: float, risk_usd: float) -> float:
-    tick_value, tick_size = tick_value_and_size(symbol)
-    if tick_value is None or tick_size is None or tick_size <= 0:
-        return 0.01
-
-    dist = abs(float(entry) - float(stop))
-    ticks = dist / tick_size
-    loss_per_lot = ticks * tick_value
-    if loss_per_lot <= 0:
-        return 0.01
-
-    lot = float(risk_usd) / loss_per_lot
-    lot = max(0.01, lot)
-    lot = int(lot * 100) / 100.0  # round down to 0.01
-    return float(lot)
+    return True, {
+        "enabled": True,
+        "reason": "pass",
+        "atr_now": atr_now,
+        "adx_now": adx_now,
+        "q": float(np.quantile(atr_tail, qv)),
+        "quantile": qv,
+        "ref_window": ref,
+    }
 
 
 # ----------------------------
-# Daily controls (FILTER by magic + symbol)
+# Daily controls (FIXED baseline)
 # ----------------------------
 def get_closed_deals_today_usd(magic: int, symbol: str) -> float:
     start = utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -354,11 +354,11 @@ def get_closed_deals_today_usd(magic: int, symbol: str) -> float:
         return 0.0
     pnl = 0.0
     for d in deals:
-        if int(getattr(d, "magic", -1)) != int(magic):
-            continue
-        if str(getattr(d, "symbol", "")) != str(symbol):
-            continue
         try:
+            if int(getattr(d, "magic", -1)) != int(magic):
+                continue
+            if str(getattr(d, "symbol", "")) != str(symbol):
+                continue
             pnl += float(getattr(d, "profit", 0.0) or 0.0)
         except Exception:
             pass
@@ -373,13 +373,17 @@ def count_closed_trades_today(magic: int, symbol: str) -> int:
         return 0
     cnt = 0
     for d in deals:
-        if int(getattr(d, "magic", -1)) != int(magic):
-            continue
-        if str(getattr(d, "symbol", "")) != str(symbol):
-            continue
-        entry = getattr(d, "entry", None)
-        if entry == 1 or (entry is None and float(getattr(d, "profit", 0.0) or 0.0) != 0.0):
-            cnt += 1
+        try:
+            if int(getattr(d, "magic", -1)) != int(magic):
+                continue
+            if str(getattr(d, "symbol", "")) != str(symbol):
+                continue
+            # entry==1 corresponds to DEAL_ENTRY_OUT in MT5 python wrapper for many brokers
+            entry = getattr(d, "entry", None)
+            if entry == 1:
+                cnt += 1
+        except Exception:
+            pass
     return int(cnt)
 
 
@@ -442,7 +446,7 @@ def send_market_buy(
     tp = round_to_symbol(symbol, tp)
 
     fill_try = [mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN]
-    res = None
+    res_last = None
     for fill in fill_try:
         req = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -461,55 +465,11 @@ def send_market_buy(
         if dry_run:
             return None
         res = mt5.order_send(req)
+        res_last = res
         logger.log("market_buy_result", symbol, timeframe, {"req": req, "result": str(res)})
-        if res is not None and (
-            getattr(res, "retcode", None) in (10009, 10008)
-            or getattr(res, "deal", 0) != 0
-            or getattr(res, "order", 0) != 0
-        ):
+        if res is not None and (getattr(res, "retcode", None) in (10009, 10008) or getattr(res, "deal", 0) != 0 or getattr(res, "order", 0) != 0):
             return res
-    return res
-
-
-def ensure_position_sltp(
-    *,
-    symbol: str,
-    magic: int,
-    sl: float,
-    tp: float,
-    logger: CSVLogger,
-    timeframe: str,
-) -> bool:
-    pos = mt5.positions_get(symbol=symbol)
-    if not pos:
-        return False
-
-    sl = round_to_symbol(symbol, sl)
-    tp = round_to_symbol(symbol, tp)
-
-    for p in pos:
-        if int(getattr(p, "magic", -1)) != int(magic):
-            continue
-        ticket = int(getattr(p, "ticket", 0))
-        current_sl = float(getattr(p, "sl", 0.0) or 0.0)
-        current_tp = float(getattr(p, "tp", 0.0) or 0.0)
-
-        if current_sl > 0 and current_tp > 0:
-            return True
-
-        req = {
-            "action": mt5.TRADE_ACTION_SLTP,
-            "position": ticket,
-            "symbol": symbol,
-            "sl": float(sl),
-            "tp": float(tp),
-            "magic": int(magic),
-        }
-        res = mt5.order_send(req)
-        logger.log("position_sltp_set", symbol, timeframe, {"ticket": ticket, "req": req, "result": str(res)})
-        return True
-
-    return False
+    return res_last
 
 
 def place_buy_stop(
@@ -540,26 +500,57 @@ def place_buy_stop(
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_RETURN,
     }
-
     logger.log("order_place_intent", symbol, timeframe, {"req": req, "dry_run": dry_run})
     if dry_run:
         return None
-
     res = mt5.order_send(req)
     logger.log("order_place_result", symbol, timeframe, {"req": req, "result": str(res)})
     return res
 
 
 # ----------------------------
-# Entry validation for BUY_STOP
+# Risk sizing (unchanged)
 # ----------------------------
-def validate_buy_stop(
-    symbol: str,
-    entry: float,
-    sl: float,
-    tp: float,
-    extra_buffer_points: int = 0,
-) -> Tuple[bool, Dict[str, Any]]:
+def tick_value_and_size(symbol: str) -> Tuple[Optional[float], Optional[float]]:
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        return None, None
+    tick_value = getattr(info, "trade_tick_value", None)
+    tick_size = getattr(info, "trade_tick_size", None)
+    if tick_size in (None, 0):
+        tick_size = getattr(info, "point", None)
+    try:
+        tick_value = float(tick_value) if tick_value is not None else None
+    except Exception:
+        tick_value = None
+    try:
+        tick_size = float(tick_size) if tick_size is not None else None
+    except Exception:
+        tick_size = None
+    return tick_value, tick_size
+
+
+def calc_lot_for_risk(symbol: str, entry: float, stop: float, risk_usd: float) -> float:
+    tick_value, tick_size = tick_value_and_size(symbol)
+    if tick_value is None or tick_size is None or tick_size <= 0:
+        return 0.01
+
+    dist = abs(float(entry) - float(stop))
+    ticks = dist / tick_size
+    loss_per_lot = ticks * tick_value
+    if loss_per_lot <= 0:
+        return 0.01
+
+    lot = float(risk_usd) / loss_per_lot
+    lot = max(0.01, lot)
+    lot = int(lot * 100) / 100.0  # round down to 0.01
+    return float(lot)
+
+
+# ----------------------------
+# BUY_STOP validation (simple)
+# ----------------------------
+def validate_buy_stop_simple(symbol: str, entry: float, sl: float, tp: float, extra_buffer_points: int = 0) -> Tuple[bool, Dict[str, Any]]:
     tick = get_tick(symbol)
     if tick is None:
         return False, {"reason": "tick_missing"}
@@ -569,13 +560,6 @@ def validate_buy_stop(
     if bid <= 0 or ask <= 0:
         return False, {"reason": "tick_bad", "bid": bid, "ask": ask}
 
-    pt = symbol_point(symbol)
-    stops_pts = stops_level_points(symbol)
-    freeze_pts = freeze_level_points(symbol)
-
-    min_dist_pts = max(stops_pts, freeze_pts) + int(extra_buffer_points)
-    min_dist = float(min_dist_pts) * float(pt)
-
     entry_r = round_to_symbol(symbol, entry)
     sl_r = round_to_symbol(symbol, sl)
     tp_r = round_to_symbol(symbol, tp)
@@ -583,35 +567,13 @@ def validate_buy_stop(
     if not (sl_r < entry_r < tp_r):
         return False, {"reason": "geometry", "entry": entry_r, "sl": sl_r, "tp": tp_r}
 
+    # Minimal buffer above ask to avoid immediate reject
+    pt = symbol_point(symbol)
+    min_dist = float(max(1, int(extra_buffer_points))) * float(pt)
     if entry_r <= ask + min_dist:
-        return False, {
-            "reason": "entry_too_close_or_below_ask",
-            "entry": entry_r,
-            "ask": ask,
-            "bid": bid,
-            "min_dist": min_dist,
-            "min_dist_pts": min_dist_pts,
-            "stops_pts": stops_pts,
-            "freeze_pts": freeze_pts,
-        }
+        return False, {"reason": "entry_too_close_or_below_ask", "entry": entry_r, "ask": ask, "bid": bid, "min_dist": min_dist}
 
-    if (entry_r - sl_r) < min_dist:
-        return False, {"reason": "sl_too_close", "entry": entry_r, "sl": sl_r, "min_dist": min_dist, "min_dist_pts": min_dist_pts}
-
-    if (tp_r - entry_r) < min_dist:
-        return False, {"reason": "tp_too_close", "entry": entry_r, "tp": tp_r, "min_dist": min_dist, "min_dist_pts": min_dist_pts}
-
-    return True, {
-        "entry": entry_r,
-        "sl": sl_r,
-        "tp": tp_r,
-        "ask": ask,
-        "bid": bid,
-        "min_dist": min_dist,
-        "min_dist_pts": min_dist_pts,
-        "stops_pts": stops_pts,
-        "freeze_pts": freeze_pts,
-    }
+    return True, {"entry": entry_r, "sl": sl_r, "tp": tp_r, "ask": ask, "bid": bid, "min_dist": min_dist}
 
 
 # ----------------------------
@@ -646,6 +608,7 @@ def main():
     ap.add_argument("--config", required=True)
     ap.add_argument("--poll_sec", type=int, default=10)
     ap.add_argument("--bars", type=int, default=250)
+    ap.add_argument("--min_bars", type=int, default=120)
     args = ap.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
@@ -657,56 +620,29 @@ def main():
     risk_cfg = cfg.get("risk", {}) or {}
     cooldown_bars = int(risk_cfg.get("cooldown_bars", 0) or 0)
 
-    # risk_filters (trend_quality_gate)
-    rf_raw = cfg.get("risk_filters", {}) or {}
-    rf_cfg = RiskFilterCfg(
-        enabled=bool(rf_raw.get("trend_quality_gate", True)),
-        tq_adx_len=int(rf_raw.get("tq_adx_len", 14) or 14),
-        tq_atr_len=int(rf_raw.get("tq_atr_len", 14) or 14),
-        tq_adx_min=float(rf_raw.get("tq_adx_min", 15.0) or 15.0),
-        tq_adx_rise_bars=int(rf_raw.get("tq_adx_rise_bars", 0) or 0),
-        tq_atr_ref_window=int(rf_raw.get("tq_atr_ref_window", 120) or 120),
-        tq_atr_quantile=float(rf_raw.get("tq_atr_quantile", 0.20) or 0.20),
-    )
-
-    # Optional execution constraints
-    max_spread_points_cfg = cfg.get("execution", {}).get("max_spread_points", None)
-    try:
-        max_spread_points_cfg = int(max_spread_points_cfg) if max_spread_points_cfg is not None else None
-    except Exception:
-        max_spread_points_cfg = None
-
-    # Entry buffer for stop validation (points)
-    entry_buffer_points = cfg.get("execution", {}).get("entry_buffer_points", 2)
-    try:
-        entry_buffer_points = int(entry_buffer_points)
-    except Exception:
-        entry_buffer_points = 2
-
-    convert_to_market_on_breakout = bool(cfg.get("execution", {}).get("convert_to_market_on_breakout", True))
+    tq_cfg = dataclass_from_dict(TrendQualityCfg, cfg.get("risk_filters", {}) or {})
+    # Accept legacy key "trend_quality_gate: true"
+    if "trend_quality_gate" in (cfg.get("risk_filters", {}) or {}):
+        tq_cfg = TrendQualityCfg(
+            enabled=bool((cfg.get("risk_filters", {}) or {}).get("trend_quality_gate", True)),
+            tq_adx_len=int((cfg.get("risk_filters", {}) or {}).get("tq_adx_len", tq_cfg.tq_adx_len)),
+            tq_atr_len=int((cfg.get("risk_filters", {}) or {}).get("tq_atr_len", tq_cfg.tq_atr_len)),
+            tq_adx_min=float((cfg.get("risk_filters", {}) or {}).get("tq_adx_min", tq_cfg.tq_adx_min)),
+            tq_adx_rise_bars=int((cfg.get("risk_filters", {}) or {}).get("tq_adx_rise_bars", tq_cfg.tq_adx_rise_bars)),
+            tq_atr_ref_window=int((cfg.get("risk_filters", {}) or {}).get("tq_atr_ref_window", tq_cfg.tq_atr_ref_window)),
+            tq_atr_quantile=float((cfg.get("risk_filters", {}) or {}).get("tq_atr_quantile", tq_cfg.tq_atr_quantile)),
+        )
 
     trade_windows_utc = list(cfg.get("trade_windows_utc", []) or [])
     block_windows_utc = list(cfg.get("block_windows_utc", []) or [])
 
-    out_dir = Path("data/derived/demo")
-    logger = CSVLogger(out_dir / "demo_events.csv")
-
-    def _reconnect(reason: str):
-        logger.log("mt5_reconnect", symbol, timeframe, {"reason": reason, "last_error": str(mt5.last_error())})
-        try:
-            mt5.shutdown()
-        except Exception:
-            pass
-        _time.sleep(1)
-        MT5Connector(MT5Config(**cfg.get("mt5", {}))).connect()
-        mt5.symbol_select(symbol, True)
-
-    # Connect MT5 once, then force symbol selection
+    # Connect MT5 once
     MT5Connector(MT5Config(**cfg.get("mt5", {}))).connect()
-    mt5.symbol_select(symbol, True)
 
-    # Ensure symbol spec exists
+    # Ensure symbol selected/known
     _ = get_symbol_spec(symbol)
+    if not ensure_symbol_selected(symbol):
+        raise RuntimeError(f"Failed mt5.symbol_select({symbol}, True). Add symbol to Market Watch.")
     _ = symbol_info_or_raise(symbol)
 
     pt = symbol_point(symbol)
@@ -717,17 +653,12 @@ def main():
     sp.pop("min_bars_between_entries", None)
     strategy = PullbackTrendStrategy(PullbackTrendParams(**sp))
 
-    # Warmup: require tick + rates before starting the loop
-    warmup_ok = False
-    for _ in range(30):
-        tick = mt5.symbol_info_tick(symbol)
-        rates = mt5.copy_rates_from_pos(symbol, tf, 0, args.bars)
-        ok_tick = tick is not None and float(getattr(tick, "bid", 0.0) or 0.0) > 0 and float(getattr(tick, "ask", 0.0) or 0.0) > 0
-        ok_rates = rates is not None and len(rates) >= 120
-        if ok_tick and ok_rates:
-            warmup_ok = True
-            break
-        _time.sleep(1)
+    out_dir = Path("data/derived/demo")
+    logger = CSVLogger(out_dir / "demo_events.csv")
+
+    # Baselines: prevent inheriting earlier PnL / trades for the day (FIX)
+    baseline_realized = get_closed_deals_today_usd(exec_cfg.magic, symbol)
+    baseline_trades = count_closed_trades_today(exec_cfg.magic, symbol)
 
     logger.log(
         "demo_start",
@@ -738,30 +669,29 @@ def main():
             "execution": exec_cfg.__dict__,
             "risk": risk_cfg,
             "strategy": sp,
-            "risk_filters": rf_cfg.__dict__,
-            "max_spread_points": max_spread_points_cfg,
-            "entry_buffer_points": entry_buffer_points,
-            "convert_to_market_on_breakout": convert_to_market_on_breakout,
+            "risk_filters": tq_cfg.__dict__,
+            "baseline_realized_usd": baseline_realized,
+            "baseline_trades": baseline_trades,
+            "point": pt,
             "trade_windows_utc": trade_windows_utc,
             "block_windows_utc": block_windows_utc,
-            "warmup_ok": warmup_ok,
         },
     )
 
-    if not warmup_ok:
-        raise SystemExit("MT5 warmup failed: no tick and/or not enough bars. Open XAUUSD M15 chart and ensure quotes are live.")
-
     last_signal_bar_time: Optional[datetime] = None
+
+    # Cooldown anchored to fills
     last_fill_time: Optional[datetime] = None
     last_pos_ticket: Optional[int] = None
-    last_intended_sl: Optional[float] = None
-    last_intended_tp: Optional[float] = None
+
     last_heartbeat = utc_now()
+    rates_fail_streak = 0
 
     while True:
         try:
             now = utc_now()
 
+            # Heartbeat
             if (now - last_heartbeat).total_seconds() >= int(exec_cfg.heartbeat_sec):
                 logger.log("heartbeat", symbol, timeframe, {})
                 last_heartbeat = now
@@ -776,36 +706,22 @@ def main():
                 _time.sleep(args.poll_sec)
                 continue
 
-            # Tick health (avoid spread_unavailable loops)
-            tick = mt5.symbol_info_tick(symbol)
-            if tick is None or float(getattr(tick, "bid", 0.0) or 0.0) <= 0 or float(getattr(tick, "ask", 0.0) or 0.0) <= 0:
-                _reconnect("tick_missing_or_zero")
-                _time.sleep(max(2, args.poll_sec))
-                continue
-
-            # Detect fills
+            # Detect fills (position open/close transitions)
             current_ticket = get_open_position_ticket(symbol, exec_cfg.magic)
             if current_ticket is not None and current_ticket != last_pos_ticket:
                 last_pos_ticket = current_ticket
                 last_fill_time = now
                 logger.log("position_open_detected", symbol, timeframe, {"ticket": current_ticket, "fill_time_utc": iso(last_fill_time)})
-                if last_intended_sl is not None and last_intended_tp is not None:
-                    ensure_position_sltp(
-                        symbol=symbol,
-                        magic=exec_cfg.magic,
-                        sl=last_intended_sl,
-                        tp=last_intended_tp,
-                        logger=logger,
-                        timeframe=timeframe,
-                    )
 
             if current_ticket is None and last_pos_ticket is not None:
                 logger.log("position_closed_detected", symbol, timeframe, {"prev_ticket": last_pos_ticket, "time_utc": iso(now)})
                 last_pos_ticket = None
 
-            # Daily controls (magic + symbol filtered)
-            realized = get_closed_deals_today_usd(exec_cfg.magic, symbol)
-            trades_today = count_closed_trades_today(exec_cfg.magic, symbol)
+            # Daily controls (FIXED baseline)
+            realized_total = get_closed_deals_today_usd(exec_cfg.magic, symbol)
+            trades_total = count_closed_trades_today(exec_cfg.magic, symbol)
+            realized = float(realized_total - baseline_realized)
+            trades_today = int(trades_total - baseline_trades)
 
             if realized <= -abs(exec_cfg.daily_loss_limit_usd):
                 logger.log("daily_stop_hit", symbol, timeframe, {"realized_usd": realized, "limit": exec_cfg.daily_loss_limit_usd})
@@ -818,15 +734,14 @@ def main():
                 continue
 
             # Spread gate
-            if max_spread_points_cfg is not None:
+            if exec_cfg.max_spread_points is not None:
                 sp_pts = spread_points(symbol)
                 if sp_pts is None:
                     logger.log("spread_unavailable", symbol, timeframe, {})
-                    _reconnect("spread_unavailable")
-                    _time.sleep(max(2, args.poll_sec))
+                    _time.sleep(args.poll_sec)
                     continue
-                if sp_pts > float(max_spread_points_cfg):
-                    logger.log("spread_block", symbol, timeframe, {"spread_points": sp_pts, "max_spread_points": max_spread_points_cfg})
+                if sp_pts > float(exec_cfg.max_spread_points):
+                    logger.log("spread_block", symbol, timeframe, {"spread_points": sp_pts, "max_spread_points": exec_cfg.max_spread_points})
                     _time.sleep(args.poll_sec)
                     continue
 
@@ -835,36 +750,17 @@ def main():
                 _time.sleep(args.poll_sec)
                 continue
 
-            # Expire pending orders
-            pendings = existing_pending(symbol, exec_cfg.magic)
-            if pendings:
-                tf_minutes = int(timeframe[1:]) if timeframe.startswith("M") else 60
-                max_age = timedelta(minutes=tf_minutes * int(exec_cfg.pending_expiry_bars))
-                for o in pendings:
-                    setup_ts = getattr(o, "time_setup", getattr(o, "time", 0))
-                    try:
-                        setup_time = to_dt_mt5(int(setup_ts), mt5_offset_sec)
-                    except Exception:
-                        setup_time = now
-                    age = now - setup_time
-                    if age > max_age:
-                        cancel_order(int(o.ticket), logger, symbol, timeframe)
-                    else:
-                        logger.log("pending_exists", symbol, timeframe, {"ticket": int(getattr(o, "ticket", 0)), "age_sec": int(age.total_seconds())})
-                _time.sleep(args.poll_sec)
-                continue
-
             # Pull latest bars
-            rates = mt5.copy_rates_from_pos(symbol, tf, 0, args.bars)
-            if rates is None:
-                logger.log("rates_none", symbol, timeframe, {"last_error": str(mt5.last_error())})
-                _reconnect("rates_none")
-                _time.sleep(max(2, args.poll_sec))
-                continue
-            if len(rates) < 120:
-                logger.log("rates_insufficient", symbol, timeframe, {"n": int(len(rates))})
+            rates = mt5.copy_rates_from_pos(symbol, tf, 0, int(args.bars))
+            if rates is None or len(rates) < int(args.min_bars):
+                rates_fail_streak += 1
+                logger.log("rates_insufficient", symbol, timeframe, {"n": 0 if rates is None else int(len(rates)), "fail_streak": rates_fail_streak})
+                # Periodically re-select symbol (fixes many MT5 “0 bars” loops)
+                if rates_fail_streak % 6 == 0:
+                    ensure_symbol_selected(symbol)
                 _time.sleep(args.poll_sec)
                 continue
+            rates_fail_streak = 0
 
             bars = rates_to_bars(rates, mt5_offset_sec)
 
@@ -879,14 +775,16 @@ def main():
                 _time.sleep(args.poll_sec)
                 continue
 
-            # Trend-quality gate (risk_filters)
-            ok_tq, tq_diag = trend_quality_pass(bars[: last_closed_index + 1], rf_cfg)
-            if not ok_tq:
-                logger.log("gate_block", symbol, timeframe, {"bar_time": iso(last_closed_bar.time_utc), **tq_diag})
+            # Trend-quality gate BEFORE decision (this is what your logs show)
+            warmup_ok = len(bars) >= int(args.min_bars)
+            ok_gate, diag_gate = trend_quality_gate(bars[: last_closed_index + 1], tq_cfg)
+            if not ok_gate:
+                logger.log("gate_block", symbol, timeframe, {"bar_time": iso(last_closed_bar.time_utc), **diag_gate, "warmup_ok": warmup_ok})
                 last_signal_bar_time = last_closed_bar.time_utc
                 _time.sleep(args.poll_sec)
                 continue
 
+            # Strategy decision on CLOSED bar
             hist = bars[: last_closed_index + 1]
             ctx = StrategyContext(symbol=symbol, timeframe=timeframe, bars=hist, bar_index=len(hist), meta={"point": pt})
             decision = strategy.on_bar(ctx)
@@ -917,29 +815,14 @@ def main():
             sl = float(decision.stop_price)
             tp = float(decision.target_price)
 
-            last_intended_sl = sl
-            last_intended_tp = tp
-
             lot = calc_lot_for_risk(symbol, entry_level, sl, exec_cfg.risk_usd_per_trade)
 
-            ok, diag = validate_buy_stop(symbol, entry_level, sl, tp, extra_buffer_points=int(entry_buffer_points))
+            ok, diag = validate_buy_stop_simple(symbol, entry_level, sl, tp, extra_buffer_points=int(exec_cfg.entry_buffer_points))
             if not ok:
                 logger.log("buy_stop_reject", symbol, timeframe, {"bar_time": iso(last_closed_bar.time_utc), **diag})
-
-                if convert_to_market_on_breakout and diag.get("reason") == "entry_too_close_or_below_ask":
-                    logger.log(
-                        "convert_to_market",
-                        symbol,
-                        timeframe,
-                        {
-                            "bar_time": iso(last_closed_bar.time_utc),
-                            "orig_entry": diag.get("entry"),
-                            "ask": diag.get("ask"),
-                            "sl": round_to_symbol(symbol, sl),
-                            "tp": round_to_symbol(symbol, tp),
-                            "lot": lot,
-                        },
-                    )
+                # If breakout already happened, convert to market
+                if exec_cfg.convert_to_market_on_breakout and diag.get("reason") == "entry_too_close_or_below_ask":
+                    logger.log("convert_to_market", symbol, timeframe, {"bar_time": iso(last_closed_bar.time_utc), "lot": lot, "sl": sl, "tp": tp})
                     send_market_buy(
                         symbol=symbol,
                         lot=lot,
@@ -970,13 +853,9 @@ def main():
                     "tp": tp,
                     "lot": lot,
                     "meta": decision.meta or {},
-                    "tq": tq_diag,
                     "realized_today_usd": realized,
                     "trades_today": trades_today,
                     "tick": {"bid": diag.get("bid"), "ask": diag.get("ask")},
-                    "min_dist_pts": diag.get("min_dist_pts"),
-                    "stops_pts": diag.get("stops_pts"),
-                    "freeze_pts": diag.get("freeze_pts"),
                 },
             )
 
