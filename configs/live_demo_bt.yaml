@@ -1,4 +1,4 @@
-run_name: "live_xauusd_m15"
+run_name: "live_xauusd_m15_r30_d90_cap4"
 
 mt5:
   login: null
@@ -14,12 +14,14 @@ strategy:
   name: "pullback_trend"
   params:
     atr_len: 14
-    atr_max_points: 9.024109318483198
+    atr_max_points: 0        # disable high-vol filter (was blocking too much live)
     sma_len: 60
     adx_min: 24.3
-    pullback_atr: 0.3
-    stop_atr: 1.2
+    pullback_atr: 0.30
+    pullback_lookback: 3     # keep default explicit
+    stop_atr: 1.20
     target_r: 2.0
+    long_only: true
 
 trade_windows_utc: ["00:00-23:59"]
 block_windows_utc: ["21:55-22:10"]
@@ -27,18 +29,28 @@ block_windows_utc: ["21:55-22:10"]
 execution:
   magic: 101001
   comment: "xauusd100_demo"
+
+  # execution / broker tolerance
   slippage_points: 50
   deviation_points: 50
+
+  # spread safety gate (live)
   max_spread_points: 45
+
+  # pending order lifecycle
   pending_expiry_bars: 4
-
-  risk_usd_per_trade: 30
-  daily_loss_limit_usd: 60
-  max_trades_per_day: 10
-  dry_run: false
-
   entry_buffer_points: 2
   convert_to_market_on_breakout: true
+
+  # risk controls
+  risk_usd_per_trade: 30
+  daily_loss_limit_usd: 90     # -3R daily stop
+  max_trades_per_day: 4        # cap=4 is better than 6 in your test
+  dry_run: false
+
+  # logging
+  heartbeat_sec: 60
+  spread_state_reminder_sec: 300
 
 risk:
   account_usd: 1500
@@ -52,3 +64,10 @@ risk_filters:
   tq_adx_rise_bars: 0
   tq_atr_ref_window: 120
   tq_atr_quantile: 0.20
+
+backtest:
+  spread_source: "rates"       # use MT5 rates spread column
+  spread_points: 60            # fallback if needed
+  spread_mode: "half"
+  intrabar_policy: "conservative"
+  warmup_min_bars: 120
