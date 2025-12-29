@@ -29,12 +29,12 @@ execution:
   comment: "xauusd100_demo"
   slippage_points: 50
   deviation_points: 50
-  max_spread_points: null
+  max_spread_points: 45
   pending_expiry_bars: 4
 
-  risk_usd_per_trade: 10
-  daily_loss_limit_usd: 30
-  max_trades_per_day: 2
+  risk_usd_per_trade: 30
+  daily_loss_limit_usd: 60
+  max_trades_per_day: 10
   dry_run: false
 
   entry_buffer_points: 2
@@ -51,5 +51,4 @@ risk_filters:
   tq_adx_min: 15
   tq_adx_rise_bars: 0
   tq_atr_ref_window: 120
-  tq_atr_quantile: 0.20   # optional to tune later
-
+  tq_atr_quantile: 0.20

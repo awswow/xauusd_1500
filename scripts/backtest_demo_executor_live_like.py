@@ -7,7 +7,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -84,14 +84,14 @@ def _apply_spread_fill_exit(price: float, *, side: Side, spread_points: int, poi
 
 
 # =========================
-# Trend Quality Gate helpers (copied from backtest_mt5_history.py)
+# Trend Quality Gate helpers
 # =========================
 def _true_range(high: float, low: float, prev_close: float) -> float:
     return max(high - low, abs(high - prev_close), abs(low - prev_close))
 
 
 def _wilder_rma(values: list[float], length: int) -> list[float]:
-    """Wilder's RMA (EMA with alpha=1/length). Returns full-length list with leading NaNs."""
+    """Wilder's RMA (EMA alpha=1/length). Returns full-length list with leading NaNs."""
     if length <= 0:
         raise ValueError("length must be > 0")
     if not values:
@@ -111,7 +111,6 @@ def _wilder_rma(values: list[float], length: int) -> list[float]:
 
 
 def compute_atr_series(bars: list[Bar], length: int) -> list[float]:
-    """ATR series aligned to bars length. Leading values will be NaN until enough history."""
     n = len(bars)
     if n < 2:
         return [float("nan")] * n
@@ -127,7 +126,7 @@ def compute_atr_series(bars: list[Bar], length: int) -> list[float]:
 def compute_adx_series(bars: list[Bar], length: int) -> list[float]:
     """
     Wilder ADX implementation that is NaN-safe and does not propagate NaNs.
-    Returns a list aligned to bars length, with NaNs until warmup is complete.
+    Returns list aligned to bars length, with NaNs until warmup completes.
     """
     n = len(bars)
     if length <= 0:
@@ -277,7 +276,6 @@ def simulate_live_like_executor(
     point: float,
     spread_cfg: BacktestSpreadCfg,
     intrabar_policy: str = "conservative",
-    entry_confirmation: str = "prev_high_break",  # matches your backtest + demo logic
 
     # A/B toggles
     use_spread_gate: bool = True,
@@ -285,23 +283,22 @@ def simulate_live_like_executor(
     gate_cfg: Optional[dict] = None,
 
     # live-exec behavior knobs:
-    max_spread_points_live_gate: Optional[int] = 45,  # THIS uses rates[i]["spread"]
+    max_spread_points_live_gate: Optional[int] = 45,  # uses rates[i]["spread"]
     pending_expiry_bars: int = 4,
     convert_to_market_on_breakout: bool = True,
     cooldown_bars: int = 16,
-    daily_loss_limit_usd: float = 30.0,  # approximate using R below
+    daily_loss_limit_usd: float = 30.0,  # approx using R * risk_usd_per_trade
     max_trades_per_day: int = 2,
     risk_usd_per_trade: float = 10.0,
     warmup_min_bars: int = 120,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, Dict[str, int]]:
     """
-    Live-like backtest of demo_executor_mt5.py behavior.
+    Live-like backtest of demo_executor_mt5.py behavior (BUY side only).
 
-    - Spread gate: uses historical `rates[i]["spread"]` (requires MT5 'spread' column).
-    - Trend gate: uses risk_filters.trend_quality_gate (same implementation as baseline backtest).
-    - Daily loss limit in USD is approximated using R * risk_usd_per_trade (we don't model lot sizing here).
+    Adds:
+      - gate/block counters (so you can prove which gate is binding)
+      - returns (trades_df, blocks)
     """
-
     def to_points(price_delta: float) -> float:
         return float(price_delta / point)
 
@@ -330,8 +327,22 @@ def simulate_live_like_executor(
     if "spread" not in names:
         raise ValueError("rates do not contain 'spread' column; cannot do live-like spread gate.")
 
-    # Trend gate config (from YAML risk_filters)
     g = gate_cfg or {}
+
+    # Diagnostics counters
+    blocks: Dict[str, int] = {
+        "warmup": 0,
+        "spread": 0,
+        "in_position": 0,
+        "pending_expired": 0,
+        "daily_stop": 0,
+        "daily_trade_cap": 0,
+        "cooldown": 0,
+        "no_signal": 0,
+        "nonbuy_signal": 0,
+        "trend_gate": 0,
+        "geometry_reject": 0,
+    }
 
     in_pos = False
     side: Optional[Side] = None
@@ -365,11 +376,12 @@ def simulate_live_like_executor(
         bar_index += 1
         b = bars[i]
 
-        # Warmup (match live executor needing enough bars for indicators)
+        # Warmup
         if i < int(warmup_min_bars):
+            blocks["warmup"] += 1
             continue
 
-        # Day rollover (UTC date)
+        # Day rollover (UTC)
         dk = b.time_utc.date().isoformat()
         if day_key is None:
             day_key = dk
@@ -382,12 +394,14 @@ def simulate_live_like_executor(
         if use_spread_gate and max_spread_points_live_gate is not None:
             cur_sp = int(rates[i]["spread"])
             if cur_sp > int(max_spread_points_live_gate):
+                blocks["spread"] += 1
                 continue
 
-        # If in position: manage exits
         fill_sp_points = _spread_points_for_bar(rates=rates, i=i, cfg=spread_cfg)
 
+        # Manage exits
         if in_pos:
+            blocks["in_position"] += 1
             assert side and entry is not None and stop is not None and target is not None and entry_time is not None
 
             exit_reason, exit_level = resolve_intrabar_exit(b, side, stop, target)
@@ -402,7 +416,6 @@ def simulate_live_like_executor(
                 risk_points = abs(to_points(entry - stop)) if side == Side.BUY else abs(to_points(stop - entry))
                 r_mult = float(pnl_points / risk_points) if risk_points > 0 else 0.0
 
-                # Approx realized USD for daily controls
                 realized_usd = float(r_mult) * float(risk_usd_per_trade)
                 day_realized_usd += realized_usd
 
@@ -422,6 +435,8 @@ def simulate_live_like_executor(
                         "r_multiple": float(r_mult),
                         "exit_reason": exit_reason,
                         "holding_bars": int(bar_index - (entry_bar_index or bar_index)),
+                        "day_realized_usd_after": float(day_realized_usd),
+                        "day_trades_after": int(day_trades),
                     }
                 )
 
@@ -434,18 +449,19 @@ def simulate_live_like_executor(
                 entry_type = None
             continue
 
-        # If pending exists: expire or fill
+        # Pending: expire or fill
         if pending_active:
             assert pending_created_index is not None and pending_price is not None
 
             # Expiry
             if (bar_index - pending_created_index) >= int(pending_expiry_bars):
+                blocks["pending_expired"] += 1
                 pending_active = False
                 pending_price = pending_sl = pending_tp = None
                 pending_created_index = None
                 continue
 
-            # Fill condition for BUY_STOP: current bar trades through pending_price
+            # Fill BUY_STOP: bar trades through pending_price
             if float(b.high) >= float(pending_price):
                 entry_level = float(pending_price)
                 entry_fill = _apply_spread_fill(
@@ -457,7 +473,9 @@ def simulate_live_like_executor(
                     pending_price = pending_sl = pending_tp = None
                     pending_created_index = None
                     continue
+
                 if not (float(pending_sl) < entry_fill < float(pending_tp)):
+                    blocks["geometry_reject"] += 1
                     pending_active = False
                     pending_price = pending_sl = pending_tp = None
                     pending_created_index = None
@@ -473,7 +491,6 @@ def simulate_live_like_executor(
                 entry_bar_index = bar_index
                 entry_type = "stop"
                 last_fill_bar_index = bar_index
-
                 day_trades += 1
 
                 # clear pending
@@ -483,39 +500,45 @@ def simulate_live_like_executor(
 
             continue
 
-        # Daily controls (like demo executor)
+        # Daily controls
         if day_realized_usd <= -abs(float(daily_loss_limit_usd)):
+            blocks["daily_stop"] += 1
             continue
         if day_trades >= int(max_trades_per_day):
+            blocks["daily_trade_cap"] += 1
             continue
 
-        # Cooldown anchored to fills (bars)
+        # Cooldown (bars since last fill)
         if cooldown_bars and last_fill_bar_index is not None:
             if (bar_index - last_fill_bar_index) < int(cooldown_bars):
+                blocks["cooldown"] += 1
                 continue
 
-        # Strategy decision on last CLOSED bar (same logic as demo executor)
-        hist = bars[:i]  # bars up to previous closed
+        # Strategy decision on last CLOSED bar (hist = bars up to previous closed)
+        hist = bars[:i]
         ctx = StrategyContext(symbol=symbol, timeframe=timeframe, bars=hist, bar_index=len(hist), meta={"point": point})
         decision = strategy.on_bar(ctx)
 
         if decision is None:
+            blocks["no_signal"] += 1
             continue
         if decision.side != Side.BUY:
+            blocks["nonbuy_signal"] += 1
             continue
 
-        # Trend Quality Gate (optional) — blocks signals pre-order, like a live filter
+        # Trend Quality Gate (optional)
         if use_trend_gate and bool(g.get("trend_quality_gate", False)):
             ok, _reason = trend_quality_gate_ok_debug(
                 hist,
                 adx_len=int(g.get("tq_adx_len", 14)),
                 atr_len=int(g.get("tq_atr_len", 14)),
-                adx_min=float(g.get("tq_adx_min", 18.0)),
-                adx_rise_bars=int(g.get("tq_adx_rise_bars", 2)),
+                adx_min=float(g.get("tq_adx_min", 15.0)),
+                adx_rise_bars=int(g.get("tq_adx_rise_bars", 0)),
                 atr_ref_window=int(g.get("tq_atr_ref_window", 120)),
-                atr_quantile=float(g.get("tq_atr_quantile", 0.35)),
+                atr_quantile=float(g.get("tq_atr_quantile", 0.20)),
             )
             if not ok:
+                blocks["trend_gate"] += 1
                 continue
 
         sl = float(decision.stop_price)
@@ -524,12 +547,13 @@ def simulate_live_like_executor(
         prev = bars[i - 1]
         stop_entry = float(prev.high)
 
-        # If breakout already happened, convert to market
+        # Convert to market if breakout already happened
         if convert_to_market_on_breakout and float(b.open) >= stop_entry:
             entry_fill = _apply_spread_fill(
                 float(b.open), side=Side.BUY, spread_points=fill_sp_points, point=point, mode=spread_cfg.spread_mode
             )
             if not (sl < entry_fill < tp):
+                blocks["geometry_reject"] += 1
                 continue
 
             in_pos = True
@@ -541,7 +565,6 @@ def simulate_live_like_executor(
             entry_bar_index = bar_index
             entry_type = "market"
             last_fill_bar_index = bar_index
-
             day_trades += 1
             continue
 
@@ -552,7 +575,7 @@ def simulate_live_like_executor(
         pending_tp = tp
         pending_created_index = bar_index
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), blocks
 
 
 def main() -> None:
@@ -608,7 +631,15 @@ def main() -> None:
     use_spread_gate = bool(int(args.use_spread_gate))
     use_trend_gate = bool(int(args.use_trend_gate))
 
-    trades = simulate_live_like_executor(
+    max_spread_points_live_gate = None
+    if ex_cfg.get("max_spread_points", None) is not None:
+        max_spread_points_live_gate = int(ex_cfg.get("max_spread_points"))
+
+    risk_usd_per_trade = float(ex_cfg.get("risk_usd_per_trade", 10.0) or 10.0)
+    daily_loss_limit_usd = float(ex_cfg.get("daily_loss_limit_usd", 30.0) or 30.0)
+    max_trades_per_day = int(ex_cfg.get("max_trades_per_day", 2) or 2)
+
+    trades, blocks = simulate_live_like_executor(
         bars=bars,
         rates=rates,
         symbol=symbol,
@@ -617,17 +648,16 @@ def main() -> None:
         point=point,
         spread_cfg=spread_cfg,
         intrabar_policy=str(bt_cfg.get("intrabar_policy", "conservative") or "conservative"),
-        entry_confirmation=str(bt_cfg.get("entry_confirmation", "prev_high_break") or "prev_high_break"),
         use_spread_gate=use_spread_gate,
         use_trend_gate=use_trend_gate,
         gate_cfg=risk_filters,
-        max_spread_points_live_gate=int(ex_cfg.get("max_spread_points", 45)) if ex_cfg.get("max_spread_points", None) is not None else None,
+        max_spread_points_live_gate=max_spread_points_live_gate,
         pending_expiry_bars=int(ex_cfg.get("pending_expiry_bars", 4) or 4),
         convert_to_market_on_breakout=bool(ex_cfg.get("convert_to_market_on_breakout", True)),
         cooldown_bars=int(risk_cfg.get("cooldown_bars", 0) or 0),
-        daily_loss_limit_usd=float(ex_cfg.get("daily_loss_limit_usd", 30.0) or 30.0),
-        max_trades_per_day=int(ex_cfg.get("max_trades_per_day", 2) or 2),
-        risk_usd_per_trade=float(ex_cfg.get("risk_usd_per_trade", 10.0) or 10.0),
+        daily_loss_limit_usd=daily_loss_limit_usd,
+        max_trades_per_day=max_trades_per_day,
+        risk_usd_per_trade=risk_usd_per_trade,
         warmup_min_bars=int(bt_cfg.get("warmup_min_bars", 120) or 120),
     )
 
@@ -643,6 +673,9 @@ def main() -> None:
 
     equity_path = out_dir / "equity_r.csv"
     pd.DataFrame({"equity_r": equity_r}).to_csv(equity_path, index=False)
+
+    total_r = float(r.sum()) if len(r) else 0.0
+    max_dd_r = float(dd.max_drawdown)
 
     stats = {
         "mode": "demo_executor_live_like_backtest",
@@ -666,16 +699,24 @@ def main() -> None:
             "convert_to_market_on_breakout": ex_cfg.get("convert_to_market_on_breakout", None),
         },
         "risk_filters": risk_filters,
+        "risk": {
+            "risk_usd_per_trade": risk_usd_per_trade,
+            "daily_loss_limit_usd": daily_loss_limit_usd,
+            "max_trades_per_day": max_trades_per_day,
+        },
         "trades": int(len(trades)),
         "avg_r": float(r.mean()) if len(r) else 0.0,
         "median_r": float(r.median()) if len(r) else 0.0,
-        "total_r": float(r.sum()) if len(r) else 0.0,
-        "max_drawdown_r": float(dd.max_drawdown),
+        "total_r": total_r,
+        "max_drawdown_r": max_dd_r,
+        "total_usd_approx": total_r * risk_usd_per_trade,
+        "max_drawdown_usd_approx": max_dd_r * risk_usd_per_trade,
         "dd_peak_index": int(dd.peak_index),
         "dd_trough_index": int(dd.trough_index),
         "dd_recovery_index": None if dd.recovery_index is None else int(dd.recovery_index),
         "exit_reason_counts": trades["exit_reason"].value_counts().to_dict() if len(trades) and "exit_reason" in trades.columns else {},
         "entry_type_counts": trades["entry_type"].value_counts().to_dict() if len(trades) and "entry_type" in trades.columns else {},
+        "blocks": blocks,
     }
 
     (out_dir / "stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")

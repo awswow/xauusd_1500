@@ -1,3 +1,4 @@
+# src/xauusd100/strategy/pullback_trend.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -133,12 +134,20 @@ class PullbackTrendStrategy(Strategy):
 
     def __init__(self, params: PullbackTrendParams):
         self.p = params
+        self._last_diag: Dict[str, Any] = {}
+
+    def last_diag(self) -> Dict[str, Any]:
+        return dict(self._last_diag or {})
+
+    def _reject(self, reason: str, **kw) -> Optional[Decision]:
+        self._last_diag = {"reason": reason, **kw}
+        return None
 
     def on_bar(self, ctx: StrategyContext) -> Optional[Decision]:
         bars = list(ctx.bars)
         need = max(self.p.sma_len + 2, 2 * self.p.atr_len + 5)
         if len(bars) < need:
-            return None
+            return self._reject("warmup", need=need, have=len(bars))
 
         high = np.array([b.high for b in bars], dtype=float)
         low = np.array([b.low for b in bars], dtype=float)
@@ -147,7 +156,8 @@ class PullbackTrendStrategy(Strategy):
         # Indicators
         sma_arr = sma(close, self.p.sma_len)
         if len(sma_arr) < 2:
-            return None
+            return self._reject("sma_insufficient", sma_len=int(self.p.sma_len), sma_n=int(len(sma_arr)))
+
         sma_last = float(sma_arr[-1])
         sma_prev = float(sma_arr[-2])
         sma_slope = sma_last - sma_prev
@@ -158,62 +168,138 @@ class PullbackTrendStrategy(Strategy):
         atr_last = float(atr_arr[-1]) if len(atr_arr) and np.isfinite(atr_arr[-1]) else None
         adx_last = float(adx_arr[-1]) if len(adx_arr) and np.isfinite(adx_arr[-1]) else None
 
+        last_close = float(close[-1])
+
         # Must have valid ATR/ADX
-        if not _finite(atr_last) or atr_last <= 0:
-            return None
+        if not _finite(atr_last) or float(atr_last) <= 0:
+            return self._reject(
+                "atr_invalid",
+                atr=atr_last,
+                adx=adx_last,
+                sma=float(sma_last),
+                close=float(last_close),
+                sma_slope=float(sma_slope),
+            )
+
         if not _finite(adx_last):
-            return None
+            return self._reject(
+                "adx_invalid",
+                atr=float(atr_last),
+                adx=adx_last,
+                sma=float(sma_last),
+                close=float(last_close),
+                sma_slope=float(sma_slope),
+            )
+
+        atr_last_f = float(atr_last)
+        adx_last_f = float(adx_last)
 
         # Optional ATR compression / chaos filters
-        if self.p.atr_min_points and atr_last < self.p.atr_min_points:
-            return None
-        if self.p.atr_max_points and atr_last > self.p.atr_max_points:
-            return None
+        if self.p.atr_min_points and atr_last_f < float(self.p.atr_min_points):
+            return self._reject(
+                "atr_below_min",
+                atr=float(atr_last_f),
+                atr_min=float(self.p.atr_min_points),
+                adx=float(adx_last_f),
+            )
 
-        last_close = float(close[-1])
+        if self.p.atr_max_points and atr_last_f > float(self.p.atr_max_points):
+            return self._reject(
+                "atr_above_max",
+                atr=float(atr_last_f),
+                atr_max=float(self.p.atr_max_points),
+                adx=float(adx_last_f),
+            )
 
         # Core trend direction gate (LONG)
         if last_close <= sma_last:
-            return None
+            return self._reject(
+                "close_below_sma",
+                close=float(last_close),
+                sma=float(sma_last),
+                adx=float(adx_last_f),
+                atr=float(atr_last_f),
+                sma_slope=float(sma_slope),
+            )
 
         # Slope gates (absolute and/or normalized)
-        if sma_slope < self.p.sma_slope_min:
-            return None
+        if sma_slope < float(self.p.sma_slope_min):
+            return self._reject(
+                "sma_slope_below_min",
+                sma_slope=float(sma_slope),
+                sma_slope_min=float(self.p.sma_slope_min),
+                sma=float(sma_last),
+                atr=float(atr_last_f),
+                adx=float(adx_last_f),
+            )
+
         if self.p.sma_slope_min_atr_frac:
-            if sma_slope < (self.p.sma_slope_min_atr_frac * atr_last):
-                return None
+            thresh = float(self.p.sma_slope_min_atr_frac) * float(atr_last_f)
+            if sma_slope < thresh:
+                return self._reject(
+                    "sma_slope_below_atr_frac",
+                    sma_slope=float(sma_slope),
+                    thresh=float(thresh),
+                    sma_slope_atr=float(sma_slope / atr_last_f) if atr_last_f else None,
+                    atr=float(atr_last_f),
+                    adx=float(adx_last_f),
+                )
 
         # ADX gate
-        if adx_last < self.p.adx_min:
-            return None
+        if adx_last_f < float(self.p.adx_min):
+            return self._reject(
+                "adx_below_min",
+                adx=float(adx_last_f),
+                adx_min=float(self.p.adx_min),
+                atr=float(atr_last_f),
+                sma=float(sma_last),
+                close=float(last_close),
+                sma_slope=float(sma_slope),
+            )
 
         # Pullback touch near SMA
         lookback = max(1, int(self.p.pullback_lookback))
-        pullback_thresh = float(self.p.pullback_atr) * float(atr_last)
+        pullback_thresh = float(self.p.pullback_atr) * float(atr_last_f)
 
         recent_lows = low[-lookback:]
         touched = bool(np.any((sma_last - recent_lows) <= pullback_thresh))
         if not touched:
-            return None
+            return self._reject(
+                "pullback_not_touched",
+                lookback=int(lookback),
+                pullback_atr=float(self.p.pullback_atr),
+                pullback_thresh=float(pullback_thresh),
+                sma=float(sma_last),
+                min_recent_low=float(np.min(recent_lows)) if len(recent_lows) else None,
+                adx=float(adx_last_f),
+                atr=float(atr_last_f),
+                close=float(last_close),
+                sma_slope=float(sma_slope),
+            )
 
         # Decision uses entry at last close as a reference; execution layer will decide actual entry price
         entry_ref = last_close
-        stop = entry_ref - (float(self.p.stop_atr) * float(atr_last))
+        stop = entry_ref - (float(self.p.stop_atr) * float(atr_last_f))
         risk_dist = entry_ref - stop
         if risk_dist <= 0:
-            return None
+            return self._reject("risk_dist_nonpositive", entry_ref=float(entry_ref), stop=float(stop), atr=float(atr_last_f))
+
         target = entry_ref + (float(self.p.target_r) * float(risk_dist))
 
         # Meta logging for regime analysis
         meta: Dict[str, Any] = {
-            "adx": float(adx_last),
-            "atr": float(atr_last),
+            "adx": float(adx_last_f),
+            "atr": float(atr_last_f),
             "sma": float(sma_last),
+            "close": float(last_close),
             "sma_slope": float(sma_slope),
-            "sma_slope_atr": float(sma_slope / atr_last) if atr_last else None,
+            "sma_slope_atr": float(sma_slope / atr_last_f) if atr_last_f else None,
             "pullback_thresh": float(pullback_thresh),
             "pullback_touched": touched,
         }
+
+        # record pass diag too (useful to confirm what “good” looks like)
+        self._last_diag = {"reason": "pass", **meta}
 
         return Decision(
             time_utc=bars[-1].time_utc,
