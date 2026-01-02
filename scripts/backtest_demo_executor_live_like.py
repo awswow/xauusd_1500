@@ -230,6 +230,8 @@ def trend_quality_gate_ok_debug(
     atr_ref_window: int,
     atr_quantile: float,
 ) -> tuple[bool, str]:
+    # Note: live gate uses numpy implementation + slightly different warmup math,
+    # but this matches the *spirit* and is stable/NaN-safe for backtest.
     need = max(adx_len * 3 + 5, atr_len * 3 + 5, atr_ref_window + 5)
     if len(hist) < need:
         return False, f"warmup(len={len(hist)} need={need})"
@@ -259,6 +261,7 @@ def trend_quality_gate_ok_debug(
     w = [float(x) for x in w if x == x]
     if len(w) == 0:
         return False, "atr_window_empty"
+
     q = float(pd.Series(w).quantile(float(atr_quantile)))
     if atr_now < q:
         return False, f"atr_below_q(atr_now={atr_now:.4f} q={q:.4f})"
@@ -276,12 +279,10 @@ def simulate_live_like_executor(
     point: float,
     spread_cfg: BacktestSpreadCfg,
     intrabar_policy: str = "conservative",
-
     # A/B toggles
     use_spread_gate: bool = True,
     use_trend_gate: bool = False,
     gate_cfg: Optional[dict] = None,
-
     # live-exec behavior knobs:
     max_spread_points_live_gate: Optional[int] = 45,  # uses rates[i]["spread"]
     pending_expiry_bars: int = 4,
@@ -295,9 +296,11 @@ def simulate_live_like_executor(
     """
     Live-like backtest of demo_executor_mt5.py behavior (BUY side only).
 
-    Adds:
-      - gate/block counters (so you can prove which gate is binding)
-      - returns (trades_df, blocks)
+    IMPORTANT FIX vs older versions:
+      - Trend-quality gate is applied BEFORE strategy decision (matches live executor).
+
+    Returns:
+      (trades_df, blocks)
     """
     def to_points(price_delta: float) -> float:
         return float(price_delta / point)
@@ -329,7 +332,6 @@ def simulate_live_like_executor(
 
     g = gate_cfg or {}
 
-    # Diagnostics counters
     blocks: Dict[str, int] = {
         "warmup": 0,
         "spread": 0,
@@ -338,9 +340,9 @@ def simulate_live_like_executor(
         "daily_stop": 0,
         "daily_trade_cap": 0,
         "cooldown": 0,
+        "trend_gate": 0,
         "no_signal": 0,
         "nonbuy_signal": 0,
-        "trend_gate": 0,
         "geometry_reject": 0,
     }
 
@@ -447,6 +449,7 @@ def simulate_live_like_executor(
                 entry_time = None
                 entry_bar_index = None
                 entry_type = None
+
             continue
 
         # Pending: expire or fill
@@ -514,19 +517,10 @@ def simulate_live_like_executor(
                 blocks["cooldown"] += 1
                 continue
 
-        # Strategy decision on last CLOSED bar (hist = bars up to previous closed)
+        # Hist used for BOTH gate + strategy (last CLOSED bar context)
         hist = bars[:i]
-        ctx = StrategyContext(symbol=symbol, timeframe=timeframe, bars=hist, bar_index=len(hist), meta={"point": point})
-        decision = strategy.on_bar(ctx)
 
-        if decision is None:
-            blocks["no_signal"] += 1
-            continue
-        if decision.side != Side.BUY:
-            blocks["nonbuy_signal"] += 1
-            continue
-
-        # Trend Quality Gate (optional)
+        # Trend Quality Gate FIRST (matches live executor)
         if use_trend_gate and bool(g.get("trend_quality_gate", False)):
             ok, _reason = trend_quality_gate_ok_debug(
                 hist,
@@ -540,6 +534,17 @@ def simulate_live_like_executor(
             if not ok:
                 blocks["trend_gate"] += 1
                 continue
+
+        # Strategy decision on last CLOSED bar
+        ctx = StrategyContext(symbol=symbol, timeframe=timeframe, bars=hist, bar_index=len(hist), meta={"point": point})
+        decision = strategy.on_bar(ctx)
+
+        if decision is None:
+            blocks["no_signal"] += 1
+            continue
+        if decision.side != Side.BUY:
+            blocks["nonbuy_signal"] += 1
+            continue
 
         sl = float(decision.stop_price)
         tp = float(decision.target_price)
@@ -587,7 +592,7 @@ def main() -> None:
 
     # A/B toggles
     ap.add_argument("--use_spread_gate", type=int, default=1)  # 1/0
-    ap.add_argument("--use_trend_gate", type=int, default=0)  # 1/0
+    ap.add_argument("--use_trend_gate", type=int, default=0)  # 1/0  (IMPORTANT: set to 1 to match live if using gate)
 
     args = ap.parse_args()
 
@@ -714,8 +719,12 @@ def main() -> None:
         "dd_peak_index": int(dd.peak_index),
         "dd_trough_index": int(dd.trough_index),
         "dd_recovery_index": None if dd.recovery_index is None else int(dd.recovery_index),
-        "exit_reason_counts": trades["exit_reason"].value_counts().to_dict() if len(trades) and "exit_reason" in trades.columns else {},
-        "entry_type_counts": trades["entry_type"].value_counts().to_dict() if len(trades) and "entry_type" in trades.columns else {},
+        "exit_reason_counts": trades["exit_reason"].value_counts().to_dict()
+        if len(trades) and "exit_reason" in trades.columns
+        else {},
+        "entry_type_counts": trades["entry_type"].value_counts().to_dict()
+        if len(trades) and "entry_type" in trades.columns
+        else {},
         "blocks": blocks,
     }
 

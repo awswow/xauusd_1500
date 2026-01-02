@@ -63,7 +63,7 @@ risk_filters:
   tq_adx_min: 15
   tq_adx_rise_bars: 0
   tq_atr_ref_window: 120
-  tq_atr_quantile: 0.20
+  tq_atr_quantile: 0.10
 
 backtest:
   spread_source: "rates"       # use MT5 rates spread column

@@ -48,7 +48,6 @@ def iso(dt: datetime) -> str:
 
 
 def epoch_utc_now() -> int:
-    # System epoch seconds (UTC-based)
     return int(_time.time())
 
 
@@ -71,13 +70,20 @@ class ExecCfg:
     deviation_points: int = 50
     dry_run: bool = False
     heartbeat_sec: int = 60
+
     # extra safety:
     max_spread_points: Optional[int] = None
     entry_buffer_points: int = 2
     convert_to_market_on_breakout: bool = True
 
+    # margin safety (NEW)
+    margin_safety_frac: float = 0.90
+    min_lot_override: Optional[float] = None
+    max_lot_override: Optional[float] = None
+
     # observability / noise control:
     spread_state_reminder_sec: int = 300  # re-log unchanged spread state every 5 min
+    daily_stop_reminder_sec: int = 60     # rate-limit daily stop spam
 
 
 @dataclass(frozen=True)
@@ -87,8 +93,8 @@ class TrendQualityCfg:
     tq_atr_len: int = 14
     tq_adx_min: float = 15.0
     tq_adx_rise_bars: int = 0
-    tq_atr_ref_window: int = 96
-    tq_atr_quantile: float = 0.10  # PnL-first: less likely to deadlock
+    tq_atr_ref_window: int = 120
+    tq_atr_quantile: float = 0.10
 
 
 class CSVLogger:
@@ -140,8 +146,7 @@ def estimate_mt5_offset_sec(symbol: str) -> int:
     sys_t = epoch_utc_now()
     offset = int(t_time - sys_t)
 
-    # Quantize to 30-minute steps to reduce noise (optional but stabilizes logs)
-    # Keep within reasonable bounds [-12h, +12h] as a sanity check.
+    # Quantize to 30-minute steps to reduce noise
     step = 30 * 60
     offset_q = int(round(offset / step) * step)
     if abs(offset_q) > 12 * 3600:
@@ -150,7 +155,6 @@ def estimate_mt5_offset_sec(symbol: str) -> int:
 
 
 def to_dt_mt5(ts: int, mt5_offset_sec: int = 0) -> datetime:
-    # Correct MT5 epoch by removing offset
     return datetime.fromtimestamp(int(ts) - int(mt5_offset_sec), tz=UTC)
 
 
@@ -169,6 +173,19 @@ def rates_to_bars(rates, mt5_offset_sec: int = 0) -> list[Bar]:
     return out
 
 
+def server_day_window_utc(mt5_offset_sec: int) -> Tuple[datetime, datetime]:
+    """
+    Defines a "server day" window (00:00 -> 24:00 in server time) expressed in UTC.
+    If server is UTC+2, then server-day starts at 22:00 UTC previous day.
+    """
+    now = utc_now()
+    server_now = now + timedelta(seconds=int(mt5_offset_sec))
+    server_midnight = server_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = server_midnight - timedelta(seconds=int(mt5_offset_sec))
+    end_utc = start_utc + timedelta(days=1)
+    return start_utc, end_utc
+
+
 # ----------------------------
 # Symbol helpers
 # ----------------------------
@@ -180,10 +197,6 @@ def symbol_info_or_raise(symbol: str):
 
 
 def ensure_symbol_selected(symbol: str) -> bool:
-    """
-    Ensures symbol is visible in Market Watch. Many 'tick missing' / 'rates None' issues
-    are simply symbol not selected.
-    """
     try:
         if mt5.symbol_select(symbol, True):
             return True
@@ -230,17 +243,6 @@ def get_spread_state(
     mt5_offset_sec: int = 0,
     stale_after_sec: int = 30,
 ) -> Tuple[str, Dict[str, Any]]:
-    """
-    Returns (state, diag)
-
-    state in:
-      - "ok"
-      - "blocked_too_wide"
-      - "unavailable_tick_none"
-      - "unavailable_bad_bid_ask"
-      - "unavailable_tick_stale"
-      - "unavailable_bad_point"
-    """
     tick = get_tick(symbol)
     if tick is None:
         return "unavailable_tick_none", {"reason": "tick_none", "mt5_last_error": _mt5_last_error_str()}
@@ -259,7 +261,6 @@ def get_spread_state(
         "mt5_offset_sec": int(mt5_offset_sec),
     }
 
-    # Stale tick detection (corrected by mt5_offset_sec)
     if t_time:
         try:
             tick_dt = to_dt_mt5(int(t_time), mt5_offset_sec)
@@ -267,19 +268,13 @@ def get_spread_state(
             diag["tick_time_utc"] = iso(tick_dt)
             diag["tick_age_sec"] = float(age_sec)
 
-            # Guard: if tick appears in the future, it's a timebase mismatch; do NOT mark as stale
+            # if tick appears in the future, don't mark stale
             if age_sec < -5:
                 diag["reason"] = "tick_time_in_future"
                 return "ok", diag
 
             if age_sec > float(stale_after_sec):
-                try:
-                    if tick_dt.weekday() >= 5:
-                        diag["reason"] = "weekend_market_closed"
-                    else:
-                        diag["reason"] = "tick_stale"
-                except Exception:
-                    diag["reason"] = "tick_stale"
+                diag["reason"] = "tick_stale"
                 diag["stale_after_sec"] = int(stale_after_sec)
                 return "unavailable_tick_stale", diag
         except Exception:
@@ -383,18 +378,13 @@ def adx_wilder(high: np.ndarray, low: np.ndarray, close: np.ndarray, n: int) -> 
     return adx_out
 
 
-def trend_quality_gate(
-    bars: list[Bar],
-    cfg: TrendQualityCfg,
-) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Returns (pass, diag). If blocked, diag includes reason.
-    """
+def trend_quality_gate(bars: list[Bar], cfg: TrendQualityCfg) -> Tuple[bool, Dict[str, Any]]:
     if not cfg.enabled:
         return True, {"enabled": False}
 
     need = max(2 * cfg.tq_atr_len + 5, cfg.tq_atr_ref_window + cfg.tq_atr_len + 5)
     if len(bars) < need:
+        # NOTE: warmup is pass-through (do not block)
         return True, {"enabled": True, "reason": "warmup", "need": need, "have": len(bars)}
 
     high = np.array([b.high for b in bars], dtype=float)
@@ -412,29 +402,15 @@ def trend_quality_gate(
     if atr_now is None or adx_now is None:
         return True, {"enabled": True, "reason": "indicator_nan"}
 
-    # ADX min gate
     if adx_now < float(cfg.tq_adx_min):
-        return False, {
-            "enabled": True,
-            "reason": "adx_below_min",
-            "adx_now": adx_now,
-            "adx_min": float(cfg.tq_adx_min),
-        }
+        return False, {"enabled": True, "reason": "adx_below_min", "adx_now": adx_now, "adx_min": float(cfg.tq_adx_min)}
 
-    # Optional "ADX rising" gate
     rise = int(cfg.tq_adx_rise_bars or 0)
     if rise > 0 and len(adx_arr) > (rise + 1):
         prev = float(adx_arr[-(rise + 1)]) if np.isfinite(adx_arr[-(rise + 1)]) else None
         if prev is not None and adx_now < prev:
-            return False, {
-                "enabled": True,
-                "reason": "adx_not_rising",
-                "adx_now": adx_now,
-                "adx_prev": prev,
-                "rise_bars": rise,
-            }
+            return False, {"enabled": True, "reason": "adx_not_rising", "adx_now": adx_now, "adx_prev": prev, "rise_bars": rise}
 
-    # ATR quantile gate
     ref = int(cfg.tq_atr_ref_window)
     qv = float(cfg.tq_atr_quantile)
     atr_tail = atr_arr[-ref:] if len(atr_arr) >= ref else atr_arr
@@ -444,33 +420,16 @@ def trend_quality_gate(
 
     q = float(np.quantile(atr_tail, qv))
     if atr_now < q:
-        return False, {
-            "enabled": True,
-            "reason": "atr_below_q",
-            "atr_now": atr_now,
-            "q": q,
-            "quantile": qv,
-            "ref_window": ref,
-        }
+        return False, {"enabled": True, "reason": "atr_below_q", "atr_now": atr_now, "q": q, "quantile": qv, "ref_window": ref}
 
-    return True, {
-        "enabled": True,
-        "reason": "pass",
-        "atr_now": atr_now,
-        "adx_now": adx_now,
-        "q": float(np.quantile(atr_tail, qv)),
-        "quantile": qv,
-        "ref_window": ref,
-    }
+    return True, {"enabled": True, "reason": "pass", "atr_now": atr_now, "adx_now": adx_now, "q": q, "quantile": qv, "ref_window": ref}
 
 
 # ----------------------------
-# Daily controls (FIXED baseline)
+# Daily controls (SERVER DAY window, baseline-safe)
 # ----------------------------
-def get_closed_deals_today_usd(magic: int, symbol: str) -> float:
-    start = utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
-    end = start + timedelta(days=1)
-    deals = mt5.history_deals_get(start, end)
+def get_closed_deals_in_window_usd(magic: int, symbol: str, start_utc: datetime, end_utc: datetime) -> float:
+    deals = mt5.history_deals_get(start_utc, end_utc)
     if deals is None:
         return 0.0
     pnl = 0.0
@@ -486,10 +445,8 @@ def get_closed_deals_today_usd(magic: int, symbol: str) -> float:
     return float(pnl)
 
 
-def count_closed_trades_today(magic: int, symbol: str) -> int:
-    start = utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
-    end = start + timedelta(days=1)
-    deals = mt5.history_deals_get(start, end)
+def count_closed_trades_in_window(magic: int, symbol: str, start_utc: datetime, end_utc: datetime) -> int:
+    deals = mt5.history_deals_get(start_utc, end_utc)
     if deals is None:
         return 0
     cnt = 0
@@ -499,8 +456,8 @@ def count_closed_trades_today(magic: int, symbol: str) -> int:
                 continue
             if str(getattr(d, "symbol", "")) != str(symbol):
                 continue
-            # entry==1 corresponds to DEAL_ENTRY_OUT in MT5 python wrapper for many brokers
             entry = getattr(d, "entry", None)
+            # entry==1 corresponds to DEAL_ENTRY_OUT in many wrappers
             if entry == 1:
                 cnt += 1
         except Exception:
@@ -559,12 +516,7 @@ def send_market_buy(
 ) -> Any:
     tick = get_tick(symbol)
     if tick is None or float(getattr(tick, "ask", 0.0) or 0.0) <= 0:
-        logger.log(
-            "market_buy_reject",
-            symbol,
-            timeframe,
-            {"reason": "tick_missing_or_bad", "mt5_last_error": _mt5_last_error_str()},
-        )
+        logger.log("market_buy_reject", symbol, timeframe, {"reason": "tick_missing_or_bad", "mt5_last_error": _mt5_last_error_str()})
         return None
 
     ask = round_to_symbol(symbol, float(tick.ask))
@@ -594,9 +546,7 @@ def send_market_buy(
         res_last = res
         logger.log("market_buy_result", symbol, timeframe, {"req": req, "result": str(res)})
         if res is not None and (
-            getattr(res, "retcode", None) in (10009, 10008)
-            or getattr(res, "deal", 0) != 0
-            or getattr(res, "order", 0) != 0
+            getattr(res, "retcode", None) in (10009, 10008) or getattr(res, "deal", 0) != 0 or getattr(res, "order", 0) != 0
         ):
             return res
     return res_last
@@ -639,7 +589,7 @@ def place_buy_stop(
 
 
 # ----------------------------
-# Risk sizing (unchanged)
+# Risk sizing (+ margin safety, overrides)
 # ----------------------------
 def tick_value_and_size(symbol: str) -> Tuple[Optional[float], Optional[float]]:
     info = mt5.symbol_info(symbol)
@@ -660,29 +610,131 @@ def tick_value_and_size(symbol: str) -> Tuple[Optional[float], Optional[float]]:
     return tick_value, tick_size
 
 
-def calc_lot_for_risk(symbol: str, entry: float, stop: float, risk_usd: float) -> float:
+def _symbol_volume_constraints(symbol: str) -> Tuple[float, float, float]:
+    info = symbol_info_or_raise(symbol)
+    vmin = float(getattr(info, "volume_min", 0.01) or 0.01)
+    vmax = float(getattr(info, "volume_max", 100.0) or 100.0)
+    vstep = float(getattr(info, "volume_step", 0.01) or 0.01)
+    return vmin, vmax, vstep
+
+
+def _quantize_lot(lot: float, vmin: float, vmax: float, vstep: float) -> float:
+    lot = max(vmin, min(vmax, float(lot)))
+    steps = math.floor((lot - vmin) / vstep + 1e-12)
+    q = vmin + steps * vstep
+    q = math.floor(q / vstep) * vstep  # extra guard
+    q = round(q, 8)
+    return max(vmin, min(vmax, q))
+
+
+def _calc_margin_required(symbol: str, lot: float, price: float) -> Optional[float]:
+    try:
+        m = mt5.order_calc_margin(mt5.ORDER_TYPE_BUY, symbol, float(lot), float(price))
+        if m is None:
+            return None
+        return float(m)
+    except Exception:
+        return None
+
+
+def calc_lot_for_risk_with_margin(
+    *,
+    symbol: str,
+    entry: float,
+    stop: float,
+    risk_usd: float,
+    margin_safety_frac: float,
+    min_lot_override: Optional[float],
+    max_lot_override: Optional[float],
+) -> Tuple[float, Dict[str, Any]]:
+    vmin, vmax, vstep = _symbol_volume_constraints(symbol)
+
+    # apply overrides to constraints
+    if min_lot_override is not None:
+        vmin = max(vmin, float(min_lot_override))
+    if max_lot_override is not None:
+        vmax = min(vmax, float(max_lot_override))
+
     tick_value, tick_size = tick_value_and_size(symbol)
-    if tick_value is None or tick_size is None or tick_size <= 0:
-        return 0.01
+
+    diag: Dict[str, Any] = {
+        "entry": float(entry),
+        "stop": float(stop),
+        "risk_usd": float(risk_usd),
+        "tick_value": tick_value,
+        "tick_size": tick_size,
+        "vmin": float(vmin),
+        "vmax": float(vmax),
+        "vstep": float(vstep),
+        "margin_safety_frac": float(margin_safety_frac),
+        "min_lot_override": None if min_lot_override is None else float(min_lot_override),
+        "max_lot_override": None if max_lot_override is None else float(max_lot_override),
+    }
+
+    if tick_value is None or tick_size is None or tick_size <= 0 or tick_value <= 0:
+        lot = float(vmin)
+        diag["reason"] = "tick_value_or_size_missing"
+        diag["raw_lot"] = None
+        diag["lot_quantized"] = float(lot)
+        return float(lot), diag
 
     dist = abs(float(entry) - float(stop))
     ticks = dist / tick_size
     loss_per_lot = ticks * tick_value
+
+    diag["pl_1lot_entry_to_stop"] = float(-loss_per_lot)  # for logging consistency
+    diag["loss_1lot_abs"] = float(loss_per_lot)
+
     if loss_per_lot <= 0:
-        return 0.01
+        lot = float(vmin)
+        diag["reason"] = "loss_per_lot_nonpositive"
+        diag["raw_lot"] = None
+        diag["lot_quantized"] = float(lot)
+        return float(lot), diag
 
-    lot = float(risk_usd) / loss_per_lot
-    lot = max(0.01, lot)
-    lot = int(lot * 100) / 100.0  # round down to 0.01
-    return float(lot)
+    raw_lot = float(risk_usd) / float(loss_per_lot)
+    diag["raw_lot"] = float(raw_lot)
+
+    lot = _quantize_lot(raw_lot, vmin=vmin, vmax=vmax, vstep=vstep)
+
+    # margin safety clamp
+    acc = mt5.account_info()
+    free_margin = float(getattr(acc, "margin_free", 0.0) or 0.0) if acc is not None else 0.0
+    diag["free_margin"] = float(free_margin)
+
+    tick = get_tick(symbol)
+    px = float(getattr(tick, "ask", entry) or entry) if tick is not None else float(entry)
+    diag["margin_price_ref"] = float(px)
+
+    if free_margin > 0 and float(margin_safety_frac) > 0:
+        budget = free_margin * float(margin_safety_frac)
+        # reduce lot until margin fits (step-wise, deterministic)
+        while lot > vmin:
+            mreq = _calc_margin_required(symbol, lot, px)
+            if mreq is None:
+                break
+            if mreq <= budget:
+                diag["margin_required"] = float(mreq)
+                diag["margin_budget"] = float(budget)
+                break
+            # step down
+            lot = _quantize_lot(lot - vstep, vmin=vmin, vmax=vmax, vstep=vstep)
+        else:
+            mreq = _calc_margin_required(symbol, vmin, px)
+            if mreq is not None:
+                diag["margin_required"] = float(mreq)
+                diag["margin_budget"] = float(budget)
+
+    diag["reason"] = "ok"
+    diag["lot_quantized"] = float(lot)
+    diag["lot_after_overrides"] = float(lot)
+    return float(lot), diag
 
 
 # ----------------------------
-# BUY_STOP validation (simple)
+# BUY_STOP validation
 # ----------------------------
-def validate_buy_stop_simple(
-    symbol: str, entry: float, sl: float, tp: float, extra_buffer_points: int = 0
-) -> Tuple[bool, Dict[str, Any]]:
+def validate_buy_stop_simple(symbol: str, entry: float, sl: float, tp: float, extra_buffer_points: int = 0) -> Tuple[bool, Dict[str, Any]]:
     tick = get_tick(symbol)
     if tick is None:
         return False, {"reason": "tick_missing", "mt5_last_error": _mt5_last_error_str()}
@@ -699,17 +751,10 @@ def validate_buy_stop_simple(
     if not (sl_r < entry_r < tp_r):
         return False, {"reason": "geometry", "entry": entry_r, "sl": sl_r, "tp": tp_r}
 
-    # Minimal buffer above ask to avoid immediate reject
     pt = symbol_point(symbol)
     min_dist = float(max(1, int(extra_buffer_points))) * float(pt)
     if entry_r <= ask + min_dist:
-        return False, {
-            "reason": "entry_too_close_or_below_ask",
-            "entry": entry_r,
-            "ask": ask,
-            "bid": bid,
-            "min_dist": min_dist,
-        }
+        return False, {"reason": "entry_too_close_or_below_ask", "entry": entry_r, "ask": ask, "bid": bid, "min_dist": min_dist}
 
     return True, {"entry": entry_r, "sl": sl_r, "tp": tp_r, "ask": ask, "bid": bid, "min_dist": min_dist}
 
@@ -742,7 +787,7 @@ def _in_any_window(now_utc: datetime, windows: List[str]) -> bool:
 
 
 # ----------------------------
-# Pending order lifecycle helpers (LIVE-LIKE)
+# Pending order lifecycle helpers
 # ----------------------------
 def _tf_minutes(timeframe: str) -> int:
     tf = (timeframe or "").upper().strip()
@@ -800,7 +845,6 @@ def main():
     cooldown_bars = int(risk_cfg.get("cooldown_bars", 0) or 0)
 
     tq_cfg = dataclass_from_dict(TrendQualityCfg, cfg.get("risk_filters", {}) or {})
-    # Accept legacy key "trend_quality_gate: true"
     if "trend_quality_gate" in (cfg.get("risk_filters", {}) or {}):
         tq_cfg = TrendQualityCfg(
             enabled=bool((cfg.get("risk_filters", {}) or {}).get("trend_quality_gate", True)),
@@ -824,8 +868,11 @@ def main():
         raise RuntimeError(f"Failed mt5.symbol_select({symbol}, True). Add symbol to Market Watch.")
     _ = symbol_info_or_raise(symbol)
 
-    # Estimate MT5 time offset (critical for stale tick + pending timestamps)
+    # Estimate MT5 time offset
     mt5_offset_sec = estimate_mt5_offset_sec(symbol)
+
+    # Server-day window (log it once)
+    day_start_utc, day_end_utc = server_day_window_utc(int(mt5_offset_sec))
 
     pt = symbol_point(symbol)
 
@@ -833,13 +880,21 @@ def main():
     sp = dict(cfg["strategy"]["params"])
     sp.pop("min_bars_between_entries", None)
     strategy = PullbackTrendStrategy(PullbackTrendParams(**sp))
+    target_r = float(sp.get("target_r", 2.0) or 2.0)
 
     out_dir = Path("data/derived/demo")
     logger = CSVLogger(out_dir / "demo_events.csv")
 
-    # Baselines: prevent inheriting earlier PnL / trades for the day (FIX)
-    baseline_realized = get_closed_deals_today_usd(exec_cfg.magic, symbol)
-    baseline_trades = count_closed_trades_today(exec_cfg.magic, symbol)
+    logger.log(
+        "server_day_window",
+        symbol,
+        timeframe,
+        {"start_utc": iso(day_start_utc), "end_utc": iso(day_end_utc), "mt5_offset_sec": int(mt5_offset_sec)},
+    )
+
+    # Baselines in SERVER-DAY window
+    baseline_realized = get_closed_deals_in_window_usd(exec_cfg.magic, symbol, day_start_utc, day_end_utc)
+    baseline_trades = count_closed_trades_in_window(exec_cfg.magic, symbol, day_start_utc, day_end_utc)
 
     logger.log(
         "demo_start",
@@ -851,8 +906,8 @@ def main():
             "risk": risk_cfg,
             "strategy": sp,
             "risk_filters": tq_cfg.__dict__,
-            "baseline_realized_usd": baseline_realized,
-            "baseline_trades": baseline_trades,
+            "baseline_realized_usd": float(baseline_realized),
+            "baseline_trades": int(baseline_trades),
             "point": pt,
             "trade_windows_utc": trade_windows_utc,
             "block_windows_utc": block_windows_utc,
@@ -868,13 +923,17 @@ def main():
     last_heartbeat = utc_now()
     rates_fail_streak = 0
 
-    # Spread state tracking (noise control)
+    # Spread state tracking
     last_spread_state: Optional[str] = None
     last_spread_state_log_time: Optional[datetime] = None
 
-    # Pending tracking (LIVE-LIKE)
+    # Daily stop log rate-limit
+    last_daily_stop_log: Optional[datetime] = None
+    last_daily_tradecap_log: Optional[datetime] = None
+
+    # Pending tracking
     pending_ticket: Optional[int] = None
-    pending_created_time: Optional[datetime] = None  # use last closed bar time when we placed it
+    pending_created_time: Optional[datetime] = None
 
     while True:
         try:
@@ -900,34 +959,37 @@ def main():
             if current_ticket is not None and current_ticket != last_pos_ticket:
                 last_pos_ticket = current_ticket
                 last_fill_time = now
-                logger.log(
-                    "position_open_detected",
-                    symbol,
-                    timeframe,
-                    {"ticket": current_ticket, "fill_time_utc": iso(last_fill_time)},
-                )
+                logger.log("position_open_detected", symbol, timeframe, {"ticket": current_ticket, "fill_time_utc": iso(last_fill_time)})
 
             if current_ticket is None and last_pos_ticket is not None:
                 logger.log("position_closed_detected", symbol, timeframe, {"prev_ticket": last_pos_ticket, "time_utc": iso(now)})
                 last_pos_ticket = None
 
-            # Daily controls (FIXED baseline)
-            realized_total = get_closed_deals_today_usd(exec_cfg.magic, symbol)
-            trades_total = count_closed_trades_today(exec_cfg.magic, symbol)
+            # Recompute server-day window each loop (handles midnight rollover)
+            day_start_utc, day_end_utc = server_day_window_utc(int(mt5_offset_sec))
+
+            # Daily controls (server-day baseline-safe)
+            realized_total = get_closed_deals_in_window_usd(exec_cfg.magic, symbol, day_start_utc, day_end_utc)
+            trades_total = count_closed_trades_in_window(exec_cfg.magic, symbol, day_start_utc, day_end_utc)
+
             realized = float(realized_total - baseline_realized)
             trades_today = int(trades_total - baseline_trades)
 
             if realized <= -abs(exec_cfg.daily_loss_limit_usd):
-                logger.log("daily_stop_hit", symbol, timeframe, {"realized_usd": realized, "limit": exec_cfg.daily_loss_limit_usd})
+                if last_daily_stop_log is None or (now - last_daily_stop_log).total_seconds() >= int(exec_cfg.daily_stop_reminder_sec):
+                    logger.log("daily_stop_hit", symbol, timeframe, {"realized_usd": realized, "limit": exec_cfg.daily_loss_limit_usd})
+                    last_daily_stop_log = now
                 _time.sleep(args.poll_sec)
                 continue
 
             if trades_today >= int(exec_cfg.max_trades_per_day):
-                logger.log("daily_trade_cap_hit", symbol, timeframe, {"trades_today": trades_today, "cap": exec_cfg.max_trades_per_day})
+                if last_daily_tradecap_log is None or (now - last_daily_tradecap_log).total_seconds() >= 60:
+                    logger.log("daily_trade_cap_hit", symbol, timeframe, {"trades_today": trades_today, "cap": exec_cfg.max_trades_per_day})
+                    last_daily_tradecap_log = now
                 _time.sleep(args.poll_sec)
                 continue
 
-            # Spread gate (diagnostic + stale tick + rate-limited logging)
+            # Spread gate
             if exec_cfg.max_spread_points is not None:
                 state, diag = get_spread_state(
                     symbol=symbol,
@@ -956,11 +1018,7 @@ def main():
                 _time.sleep(args.poll_sec)
                 continue
 
-            # -------------------------------
-            # Pending order lifecycle (LIVE-LIKE)
-            # - keep at most one pending for (symbol, magic)
-            # - cancel if older than pending_expiry_bars bars
-            # -------------------------------
+            # Pending order lifecycle
             pendings = existing_pending(symbol, exec_cfg.magic)
             if pendings:
                 latest = _pick_latest_pending(pendings)
@@ -973,14 +1031,12 @@ def main():
                         except Exception:
                             pass
 
-                # Track latest ticket
                 if latest is not None:
                     try:
                         pending_ticket = int(getattr(latest, "ticket"))
                     except Exception:
                         pending_ticket = None
 
-                # Determine creation time
                 created_dt: Optional[datetime] = None
                 if latest is not None:
                     for attr in ("time_setup", "setup_time", "time"):
@@ -994,7 +1050,6 @@ def main():
                 if created_dt is None:
                     created_dt = pending_created_time
 
-                # Expire if too old
                 if created_dt is not None:
                     bars_elapsed = _bars_between(created_dt, now, timeframe)
                     if bars_elapsed >= int(exec_cfg.pending_expiry_bars):
@@ -1009,7 +1064,6 @@ def main():
                         pending_ticket = None
                         pending_created_time = None
 
-                # If still pending, do not place a new one (matches backtest sim)
                 if existing_pending(symbol, exec_cfg.magic):
                     _time.sleep(args.poll_sec)
                     continue
@@ -1018,12 +1072,7 @@ def main():
             rates = mt5.copy_rates_from_pos(symbol, tf, 0, int(args.bars))
             if rates is None or len(rates) < int(args.min_bars):
                 rates_fail_streak += 1
-                logger.log(
-                    "rates_insufficient",
-                    symbol,
-                    timeframe,
-                    {"n": 0 if rates is None else int(len(rates)), "fail_streak": rates_fail_streak},
-                )
+                logger.log("rates_insufficient", symbol, timeframe, {"n": 0 if rates is None else int(len(rates)), "fail_streak": rates_fail_streak})
                 if rates_fail_streak % 6 == 0:
                     ensure_symbol_selected(symbol)
                 _time.sleep(args.poll_sec)
@@ -1032,7 +1081,6 @@ def main():
 
             bars = rates_to_bars(rates, int(mt5_offset_sec))
 
-            # last CLOSED bar for signaling
             last_closed_index = len(bars) - 2
             if last_closed_index < 2:
                 _time.sleep(args.poll_sec)
@@ -1044,15 +1092,9 @@ def main():
                 continue
 
             # Trend-quality gate BEFORE decision
-            warmup_ok = len(bars) >= int(args.min_bars)
             ok_gate, diag_gate = trend_quality_gate(bars[: last_closed_index + 1], tq_cfg)
             if not ok_gate:
-                logger.log(
-                    "gate_block",
-                    symbol,
-                    timeframe,
-                    {"bar_time": iso(last_closed_bar.time_utc), **diag_gate, "warmup_ok": warmup_ok},
-                )
+                logger.log("gate_block", symbol, timeframe, {"bar_time": iso(last_closed_bar.time_utc), **diag_gate, "warmup_ok": True})
                 last_signal_bar_time = last_closed_bar.time_utc
                 _time.sleep(args.poll_sec)
                 continue
@@ -1063,38 +1105,8 @@ def main():
             decision = strategy.on_bar(ctx)
             last_signal_bar_time = last_closed_bar.time_utc
 
-            # ---- FIX: log WHY there is no signal ----
             if decision is None:
-                diag = {}
-                try:
-                    if hasattr(strategy, "last_diag"):
-                        diag = strategy.last_diag() or {}
-                except Exception:
-                    diag = {}
-
                 slim = {"bar_time": iso(last_closed_bar.time_utc)}
-                if "reason" in diag:
-                    slim["reason"] = diag.get("reason")
-                for k in (
-                    "adx",
-                    "adx_min",
-                    "atr",
-                    "atr_min",
-                    "atr_max",
-                    "sma",
-                    "close",
-                    "sma_slope",
-                    "sma_slope_min",
-                    "sma_slope_atr",
-                    "pullback_thresh",
-                    "min_recent_low",
-                    "lookback",
-                    "need",
-                    "have",
-                ):
-                    if k in diag:
-                        slim[k] = diag.get(k)
-
                 logger.log("no_signal", symbol, timeframe, slim)
                 _time.sleep(args.poll_sec)
                 continue
@@ -1106,39 +1118,45 @@ def main():
 
             # Cooldown based on last fill time
             if cooldown_bars and last_fill_time is not None:
-                tf_minutes = int(timeframe[1:]) if timeframe.startswith("M") else 60
+                tf_minutes = _tf_minutes(timeframe)
                 min_gap = timedelta(minutes=tf_minutes * cooldown_bars)
                 if now - last_fill_time < min_gap:
-                    logger.log(
-                        "cooldown_block",
-                        symbol,
-                        timeframe,
-                        {"bar_time": iso(last_closed_bar.time_utc), "last_fill_time": iso(last_fill_time)},
-                    )
+                    logger.log("cooldown_block", symbol, timeframe, {"bar_time": iso(last_closed_bar.time_utc), "last_fill_time": iso(last_fill_time)})
                     _time.sleep(args.poll_sec)
                     continue
 
             # Entry confirmation: BUY_STOP at previous CLOSED bar high
             prev_bar = bars[last_closed_index - 1]
             entry_level = float(prev_bar.high)
+
             sl = float(decision.stop_price)
-            tp = float(decision.target_price)
 
-            lot = calc_lot_for_risk(symbol, entry_level, sl, exec_cfg.risk_usd_per_trade)
+            # CRITICAL FIX: recompute TP relative to *actual planned entry* to guarantee geometry
+            risk_dist = float(entry_level - sl)
+            if risk_dist <= 0:
+                logger.log("signal_reject", symbol, timeframe, {"bar_time": iso(last_closed_bar.time_utc), "reason": "risk_nonpositive", "entry": entry_level, "sl": sl})
+                _time.sleep(args.poll_sec)
+                continue
+            tp = float(entry_level + target_r * risk_dist)
 
-            ok, diag = validate_buy_stop_simple(
-                symbol, entry_level, sl, tp, extra_buffer_points=int(exec_cfg.entry_buffer_points)
+            # Lot sizing with margin safety
+            lot, lot_diag = calc_lot_for_risk_with_margin(
+                symbol=symbol,
+                entry=entry_level,
+                stop=sl,
+                risk_usd=float(exec_cfg.risk_usd_per_trade),
+                margin_safety_frac=float(exec_cfg.margin_safety_frac),
+                min_lot_override=exec_cfg.min_lot_override,
+                max_lot_override=exec_cfg.max_lot_override,
             )
+            logger.log("lot_sizing", symbol, timeframe, {"bar_time": iso(last_closed_bar.time_utc), **lot_diag})
+
+            ok, diag = validate_buy_stop_simple(symbol, entry_level, sl, tp, extra_buffer_points=int(exec_cfg.entry_buffer_points))
             if not ok:
                 logger.log("buy_stop_reject", symbol, timeframe, {"bar_time": iso(last_closed_bar.time_utc), **diag})
                 # If breakout already happened, convert to market
                 if exec_cfg.convert_to_market_on_breakout and diag.get("reason") == "entry_too_close_or_below_ask":
-                    logger.log(
-                        "convert_to_market",
-                        symbol,
-                        timeframe,
-                        {"bar_time": iso(last_closed_bar.time_utc), "lot": lot, "sl": sl, "tp": tp},
-                    )
+                    logger.log("convert_to_market", symbol, timeframe, {"bar_time": iso(last_closed_bar.time_utc), "lot": lot, "sl": sl, "tp": tp})
                     send_market_buy(
                         symbol=symbol,
                         lot=lot,
