@@ -103,10 +103,10 @@ def _finite(x: Optional[float]) -> bool:
 class PullbackTrendParams:
     # Core lengths
     atr_len: int = 14
-    sma_len: int = 60
+    sma_len: int = 80
 
     # Regime / trend-quality gates
-    adx_min: float = 20.0                 # ADX must be >= this
+    adx_min: float = 18.0                 # ADX must be >= this
     sma_slope_min: float = 0.0            # SMA slope (points per bar) must be >= this
     sma_slope_min_atr_frac: float = 0.0   # optional: slope must be >= frac * ATR (normalized slope gate)
     atr_min_points: float = 0.0           # optional: ATR must be >= this (avoid compression)
@@ -118,8 +118,8 @@ class PullbackTrendParams:
     long_only: bool = True
 
     # Risk/targets
-    stop_atr: float = 1.20
-    target_r: float = 2.0
+    stop_atr: float = 1.60
+    target_r: float = 2.5
 
 
 class PullbackTrendStrategy(Strategy):

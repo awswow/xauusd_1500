@@ -5,7 +5,7 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any
 
@@ -51,6 +51,85 @@ def rates_to_bars(rates) -> list[Bar]:
             )
         )
     return bars
+
+
+def build_weekly_regime(
+    symbol: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    sma_weeks: int,
+    require_slope: bool = True,
+    slope_lookback_weeks: int = 4,
+) -> dict:
+    """
+    Returns {monday_date: bool} — True = bullish regime (allow longs).
+    Conditions (both must be true when require_slope=True):
+      1. Weekly close > sma_weeks-week SMA  (price above long-term average)
+      2. SMA now > SMA slope_lookback_weeks ago  (SMA is still rising)
+    Fetches extra history so week 1 of backtest already has a valid SMA.
+    """
+    extra = max(sma_weeks + slope_lookback_weeks + 10, sma_weeks + 15)
+    lookback_start = start_dt - timedelta(weeks=extra)
+    weekly_rates = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_W1, lookback_start, end_dt)
+    if weekly_rates is None or len(weekly_rates) == 0:
+        return {}
+
+    closes = [float(r["close"]) for r in weekly_rates]
+    times = [datetime.fromtimestamp(int(r["time"]), tz=timezone.utc) for r in weekly_rates]
+
+    # Pre-compute SMA series (None until enough data)
+    sma_series: list[Optional[float]] = [None] * len(closes)
+    for i in range(sma_weeks - 1, len(closes)):
+        sma_series[i] = sum(closes[i - sma_weeks + 1: i + 1]) / sma_weeks
+
+    result: dict = {}
+    for i in range(len(closes)):
+        sma_now = sma_series[i]
+        if sma_now is None:
+            continue
+
+        price_above = closes[i] > sma_now
+
+        slope_ok = True
+        if require_slope and slope_lookback_weeks > 0:
+            j = i - slope_lookback_weeks
+            sma_prev = sma_series[j] if j >= 0 else None
+            slope_ok = sma_prev is not None and sma_now > sma_prev
+
+        is_bullish = price_above and slope_ok
+
+        # Regime determined by close of week i applies to next week i+1
+        if i + 1 < len(times):
+            next_week_dt = times[i + 1]
+            monday = next_week_dt.date() - timedelta(days=next_week_dt.weekday())
+            result[monday] = is_bullish
+
+    return result
+
+
+def build_daily_regime(symbol: str, start_dt: datetime, end_dt: datetime, sma_days: int) -> dict:
+    """
+    Returns {date: bool} — True = daily trend up (allow longs).
+    Uses previous day's close vs sma_days-day SMA.
+    Blocks M15 trading during multi-week corrections even when weekly regime is on.
+    """
+    lookback_start = start_dt - timedelta(days=sma_days + 10)
+    daily_rates = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_D1, lookback_start, end_dt)
+    if daily_rates is None or len(daily_rates) == 0:
+        return {}
+
+    closes = [float(r["close"]) for r in daily_rates]
+    times = [datetime.fromtimestamp(int(r["time"]), tz=timezone.utc) for r in daily_rates]
+
+    result: dict = {}
+    for i in range(sma_days - 1, len(closes)):
+        sma_val = sum(closes[i - sma_days + 1: i + 1]) / sma_days
+        is_bullish = closes[i] > sma_val
+        # Yesterday's close determines today's regime
+        if i + 1 < len(times):
+            result[times[i + 1].date()] = is_bullish
+
+    return result
 
 
 @dataclass(frozen=True)
@@ -292,6 +371,10 @@ def simulate_live_like_executor(
     max_trades_per_day: int = 2,
     risk_usd_per_trade: float = 10.0,
     warmup_min_bars: int = 120,
+    target_r: float = 2.0,
+    weekly_regime: Optional[dict] = None,  # {monday date: bool} — None disables filter
+    daily_regime: Optional[dict] = None,   # {date: bool} — None disables filter
+    monthly_loss_limit_r: float = 0.0,     # 0 = disabled; e.g. 5.0 halts entries if month down >5R
 ) -> tuple[pd.DataFrame, Dict[str, int]]:
     """
     Live-like backtest of demo_executor_mt5.py behavior (BUY side only).
@@ -340,6 +423,9 @@ def simulate_live_like_executor(
         "daily_stop": 0,
         "daily_trade_cap": 0,
         "cooldown": 0,
+        "monthly_brake": 0,
+        "regime_gate": 0,
+        "daily_regime_gate": 0,
         "trend_gate": 0,
         "no_signal": 0,
         "nonbuy_signal": 0,
@@ -372,6 +458,10 @@ def simulate_live_like_executor(
     day_realized_usd = 0.0
     day_trades = 0
 
+    # Monthly brake
+    month_key: Optional[str] = None
+    month_realized_r = 0.0
+
     bar_index = 0
 
     for i in range(2, len(bars)):
@@ -391,6 +481,14 @@ def simulate_live_like_executor(
             day_key = dk
             day_realized_usd = 0.0
             day_trades = 0
+
+        # Month rollover
+        mk = b.time_utc.strftime("%Y-%m")
+        if month_key is None:
+            month_key = mk
+        if mk != month_key:
+            month_key = mk
+            month_realized_r = 0.0
 
         # Spread gate (LIVE-LIKE): use historical per-bar spread
         if use_spread_gate and max_spread_points_live_gate is not None:
@@ -420,6 +518,7 @@ def simulate_live_like_executor(
 
                 realized_usd = float(r_mult) * float(risk_usd_per_trade)
                 day_realized_usd += realized_usd
+                month_realized_r += float(r_mult)
 
                 rows.append(
                     {
@@ -436,7 +535,7 @@ def simulate_live_like_executor(
                         "risk_points": float(risk_points),
                         "r_multiple": float(r_mult),
                         "exit_reason": exit_reason,
-                        "holding_bars": int(bar_index - (entry_bar_index or bar_index)),
+                        "holding_bars": int(bar_index - (entry_bar_index if entry_bar_index is not None else bar_index)),
                         "day_realized_usd_after": float(day_realized_usd),
                         "day_trades_after": int(day_trades),
                     }
@@ -477,7 +576,8 @@ def simulate_live_like_executor(
                     pending_created_index = None
                     continue
 
-                if not (float(pending_sl) < entry_fill < float(pending_tp)):
+                rebased_tp = entry_fill + target_r * (entry_fill - float(pending_sl))
+                if not (float(pending_sl) < entry_fill < rebased_tp):
                     blocks["geometry_reject"] += 1
                     pending_active = False
                     pending_price = pending_sl = pending_tp = None
@@ -489,7 +589,7 @@ def simulate_live_like_executor(
                 side = Side.BUY
                 entry = entry_fill
                 stop = float(pending_sl)
-                target = float(pending_tp)
+                target = rebased_tp
                 entry_time = b.time_utc
                 entry_bar_index = bar_index
                 entry_type = "stop"
@@ -515,6 +615,25 @@ def simulate_live_like_executor(
         if cooldown_bars and last_fill_bar_index is not None:
             if (bar_index - last_fill_bar_index) < int(cooldown_bars):
                 blocks["cooldown"] += 1
+                continue
+
+        # Monthly performance brake
+        if monthly_loss_limit_r > 0 and month_realized_r <= -abs(float(monthly_loss_limit_r)):
+            blocks["monthly_brake"] += 1
+            continue
+
+        # Macro regime gate: weekly close must be above N-week SMA (and SMA rising)
+        if weekly_regime is not None:
+            bar_date = b.time_utc.date()
+            monday = bar_date - timedelta(days=bar_date.weekday())
+            if not weekly_regime.get(monday, False):
+                blocks["regime_gate"] += 1
+                continue
+
+        # Daily trend gate: daily close must be above N-day SMA
+        if daily_regime is not None:
+            if not daily_regime.get(b.time_utc.date(), False):
+                blocks["daily_regime_gate"] += 1
                 continue
 
         # Hist used for BOTH gate + strategy (last CLOSED bar context)
@@ -557,7 +676,8 @@ def simulate_live_like_executor(
             entry_fill = _apply_spread_fill(
                 float(b.open), side=Side.BUY, spread_points=fill_sp_points, point=point, mode=spread_cfg.spread_mode
             )
-            if not (sl < entry_fill < tp):
+            rebased_tp = entry_fill + target_r * (entry_fill - sl)
+            if not (sl < entry_fill < rebased_tp):
                 blocks["geometry_reject"] += 1
                 continue
 
@@ -565,7 +685,7 @@ def simulate_live_like_executor(
             side = Side.BUY
             entry = entry_fill
             stop = sl
-            target = tp
+            target = rebased_tp
             entry_time = b.time_utc
             entry_bar_index = bar_index
             entry_type = "market"
@@ -594,6 +714,13 @@ def main() -> None:
     ap.add_argument("--use_spread_gate", type=int, default=1)  # 1/0
     ap.add_argument("--use_trend_gate", type=int, default=0)  # 1/0  (IMPORTANT: set to 1 to match live if using gate)
 
+    # Strategy param overrides (override single params without editing the config)
+    ap.add_argument("--stop_atr_override",     type=float, default=None)
+    ap.add_argument("--adx_min_override",      type=float, default=None)
+    ap.add_argument("--sma_len_override",      type=int,   default=None)
+    ap.add_argument("--pullback_atr_override", type=float, default=None)
+    ap.add_argument("--target_r_override",     type=float, default=None)
+
     args = ap.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
@@ -620,12 +747,35 @@ def main() -> None:
 
     sp = dict(cfg["strategy"]["params"])
     sp.pop("min_bars_between_entries", None)
+    if args.stop_atr_override     is not None: sp["stop_atr"]     = args.stop_atr_override
+    if args.adx_min_override      is not None: sp["adx_min"]      = args.adx_min_override
+    if args.sma_len_override      is not None: sp["sma_len"]      = args.sma_len_override
+    if args.pullback_atr_override is not None: sp["pullback_atr"] = args.pullback_atr_override
+    if args.target_r_override     is not None: sp["target_r"]     = args.target_r_override
     strategy = PullbackTrendStrategy(PullbackTrendParams(**sp))
 
     bt_cfg = cfg.get("backtest", {}) or {}
     ex_cfg = cfg.get("execution", {}) or {}
     risk_cfg = cfg.get("risk", {}) or {}
     risk_filters = cfg.get("risk_filters", {}) or {}
+    regime_filter_cfg = cfg.get("regime_filter", {}) or {}
+
+    weekly_regime: Optional[dict] = None
+    if regime_filter_cfg.get("enabled", False):
+        sma_weeks = int(regime_filter_cfg.get("sma_weeks", 40))
+        require_slope = bool(regime_filter_cfg.get("require_slope", True))
+        slope_lookback = int(regime_filter_cfg.get("slope_lookback_weeks", 4))
+        weekly_regime = build_weekly_regime(
+            symbol, start, end, sma_weeks,
+            require_slope=require_slope,
+            slope_lookback_weeks=slope_lookback,
+        )
+
+    daily_filter_cfg = cfg.get("daily_filter", {}) or {}
+    daily_regime: Optional[dict] = None
+    if daily_filter_cfg.get("enabled", False):
+        sma_days = int(daily_filter_cfg.get("sma_days", 20))
+        daily_regime = build_daily_regime(symbol, start, end, sma_days)
 
     spread_cfg = BacktestSpreadCfg(
         spread_source=str(bt_cfg.get("spread_source", "fixed") or "fixed"),
@@ -643,6 +793,10 @@ def main() -> None:
     risk_usd_per_trade = float(ex_cfg.get("risk_usd_per_trade", 10.0) or 10.0)
     daily_loss_limit_usd = float(ex_cfg.get("daily_loss_limit_usd", 30.0) or 30.0)
     max_trades_per_day = int(ex_cfg.get("max_trades_per_day", 2) or 2)
+    target_r = float((cfg.get("strategy", {}) or {}).get("params", {}).get("target_r", 2.5) or 2.5)
+    if args.target_r_override is not None:
+        target_r = args.target_r_override
+    monthly_loss_limit_r = float((cfg.get("risk", {}) or {}).get("monthly_loss_limit_r", 0.0) or 0.0)
 
     trades, blocks = simulate_live_like_executor(
         bars=bars,
@@ -664,6 +818,10 @@ def main() -> None:
         max_trades_per_day=max_trades_per_day,
         risk_usd_per_trade=risk_usd_per_trade,
         warmup_min_bars=int(bt_cfg.get("warmup_min_bars", 120) or 120),
+        target_r=target_r,
+        weekly_regime=weekly_regime,
+        daily_regime=daily_regime,
+        monthly_loss_limit_r=monthly_loss_limit_r,
     )
 
     out_dir = Path(args.out)
@@ -704,6 +862,18 @@ def main() -> None:
             "convert_to_market_on_breakout": ex_cfg.get("convert_to_market_on_breakout", None),
         },
         "risk_filters": risk_filters,
+        "regime_filter": {
+            "enabled": bool(regime_filter_cfg.get("enabled", False)),
+            "sma_weeks": int(regime_filter_cfg.get("sma_weeks", 40)),
+            "weeks_bullish": sum(1 for v in (weekly_regime or {}).values() if v),
+            "weeks_bearish": sum(1 for v in (weekly_regime or {}).values() if not v),
+        },
+        "daily_filter": {
+            "enabled": bool(daily_filter_cfg.get("enabled", False)),
+            "sma_days": int(daily_filter_cfg.get("sma_days", 20)),
+            "days_bullish": sum(1 for v in (daily_regime or {}).values() if v),
+            "days_bearish": sum(1 for v in (daily_regime or {}).values() if not v),
+        },
         "risk": {
             "risk_usd_per_trade": risk_usd_per_trade,
             "daily_loss_limit_usd": daily_loss_limit_usd,

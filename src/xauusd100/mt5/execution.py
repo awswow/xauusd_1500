@@ -109,3 +109,77 @@ class MT5Executor:
             message=last_err or "unknown execution failure",
             meta={},
         )
+
+    def send_pending_buy_stop(
+        self,
+        *,
+        symbol: str,
+        volume: float,
+        trigger_price: float,
+        sl: float,
+        tp: float,
+        magic: int,
+        comment: str = "",
+        deviation_points: int = 30,
+    ) -> Fill:
+        """Place a BUY_STOP pending order at trigger_price with attached SL/TP."""
+        volume = self.rules.round_volume(volume)
+        sl = float(self.rules.enforce_stop_distance(trigger_price, sl, "BUY"))
+        tp = float(self.rules.enforce_target_distance(trigger_price, tp, "BUY"))
+
+        for key in self.cfg.filling_preference:
+            filling = FILLING_MAP.get(key)
+            if filling is None:
+                continue
+            request = {
+                "action": mt5.TRADE_ACTION_PENDING,
+                "symbol": symbol,
+                "volume": float(volume),
+                "type": mt5.ORDER_TYPE_BUY_STOP,
+                "price": float(trigger_price),
+                "sl": float(sl),
+                "tp": float(tp),
+                "deviation": int(deviation_points),
+                "magic": int(magic),
+                "comment": comment or self.cfg.comment,
+                "type_filling": filling,
+                "type_time": mt5.ORDER_TIME_GTC,
+            }
+            result = mt5.order_send(request)
+            if result is None:
+                continue
+            retcode = int(result.retcode)
+            msg = str(getattr(result, "comment", ""))
+            if retcode == mt5.TRADE_RETCODE_DONE:
+                return Fill(
+                    time_utc=_now_utc(),
+                    symbol=symbol,
+                    side=Side.BUY,
+                    volume=float(volume),
+                    price=float(trigger_price),
+                    order_ticket=int(getattr(result, "order", 0) or 0) or None,
+                    deal_ticket=None,
+                    retcode=retcode,
+                    message=msg,
+                    meta={"pending": True, "filling": key},
+                )
+
+        return Fill(
+            time_utc=_now_utc(),
+            symbol=symbol,
+            side=Side.BUY,
+            volume=float(volume),
+            price=0.0,
+            order_ticket=None,
+            deal_ticket=None,
+            retcode=-1,
+            message="pending_placement_failed",
+            meta={},
+        )
+
+    def cancel_pending(self, ticket: int) -> bool:
+        """Cancel a pending order by ticket number. Returns True if MT5 confirms removal."""
+        result = mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": int(ticket)})
+        if result is None:
+            return False
+        return int(result.retcode) == mt5.TRADE_RETCODE_DONE

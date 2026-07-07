@@ -1,10 +1,10 @@
-run_name: "live_xauusd_m15_r30_d90_cap4"
+run_name: "live_xauusd_m15_demo"
 
 mt5:
-  login: null
-  password: null
-  server: null
-  path: null
+  login: 5052608241
+  password: "8nZs_iTt"
+  server: "MetaQuotes-Demo"
+  path: null               # leave null if MT5 is already running
   timeout_ms: 10000
 
 symbol: "XAUUSD"
@@ -15,19 +15,19 @@ strategy:
   params:
     atr_len: 14
     atr_max_points: 0        # disable high-vol filter (was blocking too much live)
-    sma_len: 60
-    adx_min: 24.3
+    sma_len: 80
+    adx_min: 18.0
     pullback_atr: 0.30
     pullback_lookback: 3     # keep default explicit
-    stop_atr: 1.20
-    target_r: 2.0
+    stop_atr: 1.60
+    target_r: 2.5
     long_only: true
 
 trade_windows_utc: ["00:00-23:59"]
 block_windows_utc: ["21:55-22:10"]
 
 execution:
-  magic: 101001
+  magic: 5052608241
   comment: "xauusd100_demo"
 
   # execution / broker tolerance
@@ -43,8 +43,8 @@ execution:
   convert_to_market_on_breakout: true
 
   # risk controls
-  risk_usd_per_trade: 30
-  daily_loss_limit_usd: 90     # -3R daily stop
+  risk_usd_per_trade: 15       # half-size for live validation phase ($15 = 1.5% of $1000)
+  daily_loss_limit_usd: 45     # -3R daily stop (scaled with risk)
   max_trades_per_day: 4        # cap=4 is better than 6 in your test
   dry_run: false
 
@@ -53,8 +53,9 @@ execution:
   spread_state_reminder_sec: 300
 
 risk:
-  account_usd: 1500
+  account_usd: 1000
   cooldown_bars: 16
+  monthly_loss_limit_r: 5.0   # halt new entries if month is down >5R
 
 risk_filters:
   trend_quality_gate: true
@@ -63,7 +64,17 @@ risk_filters:
   tq_adx_min: 15
   tq_adx_rise_bars: 0
   tq_atr_ref_window: 120
-  tq_atr_quantile: 0.10
+  tq_atr_quantile: 0.20
+
+regime_filter:
+  enabled: true
+  sma_weeks: 40                # only allow longs when weekly close > 40-week SMA
+  require_slope: true            # AND the 40-week SMA itself must be rising
+  slope_lookback_weeks: 4      # compare SMA now vs SMA 4 weeks ago
+
+daily_filter:
+  enabled: false
+  sma_days: 20
 
 backtest:
   spread_source: "rates"       # use MT5 rates spread column
