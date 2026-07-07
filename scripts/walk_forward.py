@@ -1,17 +1,22 @@
 """
 Walk-forward validation for XAUUSD M15 pullback strategy.
 
-Structure:
+Two modes:
+
+Single-split (default):
   Train : 2022-01-01 to 2023-12-31  (parameter selection)
   Test  : 2024-01-01 to 2025-12-19  (blind hold-out)
 
-Performance:
-  All indicator series are pre-computed ONCE per bar set (O(n)).
-  Each grid combination runs the backtest loop in O(n).
-  Full 81-combo grid completes in seconds, not minutes.
+Nested rolling (--nested):
+  Three rolling windows, each training on all prior years and evaluating on
+  the next unseen year.  All five strategy params (adx_min, sma_len,
+  stop_atr, target_r, pullback_atr) are optimised within each training
+  window.  Only OOS results are aggregated — no in-sample leakage.
+  432-combo grid; runs in seconds per window.
 
 Usage:
   python scripts/walk_forward.py --config configs/live_demo_bt.yaml
+  python scripts/walk_forward.py --config configs/live_demo_bt.yaml --nested
 """
 from __future__ import annotations
 
@@ -36,6 +41,7 @@ from xauusd100.mt5.symbols import get_symbol_spec
 
 from backtest_demo_executor_live_like import build_weekly_regime, parse_dt
 
+# ── Single-split constants ────────────────────────────────────────────────────
 TRAIN_START = "2022-01-01"
 TRAIN_END   = "2023-12-31"
 TEST_START  = "2024-01-01"
@@ -48,10 +54,36 @@ GRID = {
     "stop_atr":     [1.00, 1.20, 1.60],
 }
 
-FIXED_ATR_LEN   = 14
-FIXED_TARGET_R  = 2.0
+# ── Nested rolling WF constants ───────────────────────────────────────────────
+
+# All five strategy params in the grid (adx_min × sma_len × stop_atr × target_r × pullback_atr)
+NESTED_GRID = {
+    "adx_min":      [15.0, 18.0, 21.0, 24.3],
+    "sma_len":      [60,   80,   100],
+    "stop_atr":     [1.20, 1.40, 1.60, 1.80],
+    "target_r":     [2.0,  2.5,  3.0],
+    "pullback_atr": [0.20, 0.30, 0.45],
+}
+
+# Fetched as separate yearly calls to stay under the MT5 two-year rate limit
+YEARLY_SLICES = [
+    ("2022", "2022-01-01", "2022-12-31"),
+    ("2023", "2023-01-01", "2023-12-31"),
+    ("2024", "2024-01-01", "2024-12-31"),
+    ("2025", "2025-01-01", "2025-12-19"),
+]
+
+# (label, train_year_keys, test_year_key)
+ROLLING_WINDOWS = [
+    ("W1: train=2022       test=2023",   ["2022"],                      "2023"),
+    ("W2: train=2022-23    test=2024",   ["2022", "2023"],               "2024"),
+    ("W3: train=2022-24    test=2025",   ["2022", "2023", "2024"],       "2025"),
+]
+
+FIXED_ATR_LEN          = 14
+FIXED_TARGET_R         = 2.0
 FIXED_PULLBACK_LOOKBACK = 3
-WARMUP = 200  # bars skipped at start
+WARMUP = 200  # bars skipped at start of every backtest
 
 
 # ── Indicator computation (numpy, causal, computed once) ─────────────────────
@@ -412,11 +444,237 @@ def _stats(trades: list[dict]) -> dict:
     }
 
 
+# ── Nested rolling walk-forward ───────────────────────────────────────────────
+
+def run_nested_wf(
+    yearly_rates: dict[str, np.ndarray],
+    full_regime: Optional[dict],
+    *,
+    max_spread_points: int,
+    gate_cfg: dict,
+    point: float,
+    fixed_exec: dict,
+    top_n: int = 3,
+) -> dict:
+    """
+    For each rolling window: optimise the full NESTED_GRID on the train
+    period, freeze the winner, evaluate on the unseen test year.
+    Aggregate only OOS results — no in-sample leakage.
+    """
+    ng_keys  = list(NESTED_GRID.keys())
+    ng_vals  = list(NESTED_GRID.values())
+    combos   = list(itertools.product(*ng_vals))
+    n_combos = len(combos)
+    sma_lens = sorted(set(NESTED_GRID["sma_len"]))
+
+    sep = "=" * 96
+    print(f"\n{sep}")
+    print(f"NESTED ROLLING WALK-FORWARD")
+    grid_desc = " x ".join(f"{k}({len(v)})" for k, v in NESTED_GRID.items())
+    print(f"Grid: {grid_desc} = {n_combos} combos per window")
+    print(sep)
+
+    window_results: list[dict] = []
+    all_oos_trades: list[dict] = []
+
+    for win_label, train_years, test_year in ROLLING_WINDOWS:
+        print(f"\n  {win_label}")
+        print(f"  {'─' * 70}")
+
+        tr_parts = [yearly_rates[y] for y in train_years if y in yearly_rates]
+        te_parts = [yearly_rates[test_year]] if test_year in yearly_rates else []
+        if not tr_parts or not te_parts:
+            print("  [skip] missing rate data for this window")
+            continue
+
+        train_arr = np.concatenate(tr_parts)
+        test_arr  = te_parts[0]
+
+        print(f"  Bars — train: {len(train_arr):,}  test: {len(test_arr):,}  ", end="", flush=True)
+        t0 = _time.time()
+        train_pc = precompute(train_arr, sma_lens=sma_lens,
+                              regime_dict=full_regime,
+                              max_spread_points=max_spread_points,
+                              gate_cfg=gate_cfg, point=point)
+        test_pc  = precompute(test_arr, sma_lens=sma_lens,
+                              regime_dict=full_regime,
+                              max_spread_points=max_spread_points,
+                              gate_cfg=gate_cfg, point=point)
+        print(f"precompute: {_time.time() - t0:.1f}s")
+
+        print(f"  Sweeping {n_combos} combos on train...", end=" ", flush=True)
+        t0 = _time.time()
+        grid_res: list[dict] = []
+        for combo in combos:
+            p      = dict(zip(ng_keys, combo))
+            trades = fast_backtest(train_pc, **p, **fixed_exec)
+            s      = _stats(trades)
+            grid_res.append({"params": p, "stats": s})
+        print(f"{_time.time() - t0:.1f}s")
+
+        valid = [r for r in grid_res
+                 if r["stats"]["trades"] >= 20 and r["stats"]["total_r"] > 0]
+        valid.sort(key=lambda x: x["stats"]["calmar"], reverse=True)
+
+        if not valid:
+            print("  [!] No valid combo on train — skipping window")
+            continue
+
+        winner = valid[0]
+        win_p  = winner["params"]
+        win_tr = winner["stats"]
+
+        oos_trades = fast_backtest(test_pc, **win_p, **fixed_exec)
+        oos_stats  = _stats(oos_trades)
+        all_oos_trades.extend(oos_trades)
+
+        pstr = (f"adx={win_p['adx_min']:.1f}  sma={win_p['sma_len']}  "
+                f"sa={win_p['stop_atr']:.2f}  tr={win_p['target_r']:.1f}  "
+                f"pa={win_p['pullback_atr']:.2f}")
+        print(f"\n  Train winner: {pstr}")
+
+        hdr = (f"  {'Segment':<12}  {'Trades':>6}  {'Win%':>5}  "
+               f"{'Total R':>8}  {'MaxDD':>6}  {'Calmar':>7}")
+        print(hdr)
+        print(f"  {'─'*12}  {'─'*6}  {'─'*5}  {'─'*8}  {'─'*6}  {'─'*7}")
+        for seg_name, stats, note in [
+            ("Train",    win_tr,    ""),
+            ("OOS test", oos_stats, "  <- hold-out"),
+        ]:
+            cal_s = f"{stats['calmar']:>7.2f}" if stats["calmar"] not in (-999, 999) else "    n/a"
+            print(f"  {seg_name:<12}  {stats['trades']:>6}  {stats['win_rate']*100:>4.1f}%  "
+                  f"{stats['total_r']:>+8.2f}  {stats['max_dd']:>6.2f}  {cal_s}{note}")
+
+        print(f"\n  Top-{top_n} train combos (param stability check):")
+        for rank, r in enumerate(valid[:top_n], 1):
+            rp = r["params"]; rs = r["stats"]
+            print(f"    #{rank}: adx={rp['adx_min']:.1f} sma={rp['sma_len']:>3} "
+                  f"sa={rp['stop_atr']:.2f} tr={rp['target_r']:.1f} pa={rp['pullback_atr']:.2f}"
+                  f"  ->  {rs['total_r']:>+7.2f}R  Cal={rs['calmar']:.2f}")
+
+        window_results.append({
+            "label":        win_label,
+            "winner_params": win_p,
+            "train_stats":  win_tr,
+            "oos_stats":    oos_stats,
+            "top_n_train":  [{"params": r["params"], "stats": r["stats"]} for r in valid[:top_n]],
+        })
+
+    agg = _stats(all_oos_trades)
+
+    print(f"\n{sep}")
+    print("AGGREGATED OOS RESULTS  (concatenated across all rolling windows)")
+    print(sep)
+    cal_s = f"{agg['calmar']:.2f}" if agg["calmar"] not in (-999, 999) else "n/a"
+    print(f"\n  Trades: {agg['trades']}  |  Win%: {agg['win_rate']*100:.1f}%  |  "
+          f"Total R: {agg['total_r']:+.2f}R  |  Max DD: {agg['max_dd']:.2f}R  |  "
+          f"Calmar: {cal_s}")
+
+    print(f"\n  Per-window OOS breakdown:")
+    for wr in window_results:
+        s   = wr["oos_stats"]
+        cal = f"{s['calmar']:.2f}" if s["calmar"] not in (-999, 999) else "n/a"
+        print(f"    {wr['label']:<42}  "
+              f"{s['trades']:>4} trades  {s['total_r']:>+7.2f}R  Calmar={cal}")
+
+    if len(window_results) > 1:
+        print(f"\n  Winner params per window (consistency check):")
+        for wr in window_results:
+            wp = wr["winner_params"]
+            print(f"    {wr['label'][:34]:<34}  "
+                  f"adx={wp['adx_min']:.1f}  sma={wp['sma_len']}  "
+                  f"sa={wp['stop_atr']:.2f}  tr={wp['target_r']:.1f}  "
+                  f"pa={wp['pullback_atr']:.2f}")
+
+    # How close is the current live config to the nested WF winners?
+    live_p = {"adx_min": 18.0, "sma_len": 80, "stop_atr": 1.60, "target_r": 2.5, "pullback_atr": 0.30}
+    print(f"\n  Current live config for reference:")
+    print(f"    adx={live_p['adx_min']:.1f}  sma={live_p['sma_len']}  "
+          f"sa={live_p['stop_atr']:.2f}  tr={live_p['target_r']:.1f}  "
+          f"pa={live_p['pullback_atr']:.2f}")
+
+    print(f"\n{sep}\n")
+
+    return {
+        "windows":    window_results,
+        "agg_oos":    agg,
+        "oos_trades": all_oos_trades,
+    }
+
+
+# ── Entry points ──────────────────────────────────────────────────────────────
+
+def _run_nested(
+    args,
+    cfg: dict,
+    symbol: str,
+    tf: int,
+    rf_cfg: dict,
+    regime_cfg: dict,
+    fixed_exec: dict,
+    max_spread_points: int,
+    point: float,
+) -> None:
+    """Nested rolling walk-forward: fetch yearly bars, run rolling optimisation."""
+    timeframe_name = cfg["timeframe"]
+    print(f"\nLoading bars: {symbol} {timeframe_name}")
+
+    yearly_rates: dict[str, np.ndarray] = {}
+    for yr_label, yr_start, yr_end in YEARLY_SLICES:
+        rates = mt5.copy_rates_range(symbol, tf, parse_dt(yr_start), parse_dt(yr_end))
+        if rates is None or len(rates) == 0:
+            print(f"  {yr_label}: no data — skipping")
+            continue
+        yearly_rates[yr_label] = rates
+        print(f"  {yr_label}: {len(rates):,} bars")
+
+    if len(yearly_rates) < 2:
+        raise SystemExit("Not enough yearly data to run nested WF.")
+
+    full_regime: Optional[dict] = None
+    if regime_cfg.get("enabled", False):
+        sma_w    = int(regime_cfg.get("sma_weeks", 40))
+        slope    = bool(regime_cfg.get("require_slope", True))
+        lb_weeks = int(regime_cfg.get("slope_lookback_weeks", 4))
+        print("  Building full-range regime dict (2022-2025)...")
+        # Two calls to stay within MT5 two-year limit for weekly bars
+        r1 = build_weekly_regime(symbol, parse_dt("2022-01-01"), parse_dt("2023-12-31"),
+                                 sma_w, require_slope=slope, slope_lookback_weeks=lb_weeks)
+        r2 = build_weekly_regime(symbol, parse_dt("2024-01-01"), parse_dt("2025-12-19"),
+                                 sma_w, require_slope=slope, slope_lookback_weeks=lb_weeks)
+        full_regime = {}
+        if r1: full_regime.update(r1)
+        if r2: full_regime.update(r2)
+        print(f"  Regime dict: {len(full_regime)} weeks")
+
+    result = run_nested_wf(
+        yearly_rates, full_regime,
+        max_spread_points=max_spread_points,
+        gate_cfg=rf_cfg, point=point,
+        fixed_exec=fixed_exec,
+        top_n=args.top_n,
+    )
+
+    out_dir  = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "nested_wf_results.json"
+    out_path.write_text(
+        json.dumps({"windows": result["windows"], "agg_oos": result["agg_oos"]},
+                   indent=2, default=str),
+        encoding="utf-8",
+    )
+    print(f"  Results saved: {out_path}\n")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     ap.add_argument("--out",    default="data/derived/runs/walk_forward")
     ap.add_argument("--top_n", type=int, default=5)
+    ap.add_argument(
+        "--nested", action="store_true",
+        help="Run nested rolling WF: all 5 params in grid, 3 rolling windows, pure OOS aggregation",
+    )
     args = ap.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
@@ -426,7 +684,6 @@ def main() -> None:
                  "H1": mt5.TIMEFRAME_H1}[timeframe]
     ex_cfg    = cfg.get("execution", {}) or {}
     risk_cfg  = cfg.get("risk",      {}) or {}
-    bt_cfg    = cfg.get("backtest",  {}) or {}
     rf_cfg    = cfg.get("risk_filters", {}) or {}
     regime_cfg = cfg.get("regime_filter", {}) or {}
 
@@ -440,12 +697,19 @@ def main() -> None:
     }
     max_spread_points = int(ex_cfg.get("max_spread_points", 45))
 
-    cur_sp = dict(cfg["strategy"]["params"])
-    cur_sp.pop("min_bars_between_entries", None)
-
     MT5Connector(MT5Config(**cfg.get("mt5", {}))).connect()
     spec  = get_symbol_spec(symbol)
     point = float(spec.point)
+
+    # ── Nested rolling mode ──────────────────────────────────────────────────
+    if args.nested:
+        _run_nested(args, cfg, symbol, tf, rf_cfg, regime_cfg,
+                    fixed_exec, max_spread_points, point)
+        return
+
+    # ── Single-split mode (original) ─────────────────────────────────────────
+    cur_sp = dict(cfg["strategy"]["params"])
+    cur_sp.pop("min_bars_between_entries", None)
 
     train_start = parse_dt(TRAIN_START)
     train_end   = parse_dt(TRAIN_END)
