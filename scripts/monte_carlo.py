@@ -8,6 +8,10 @@ Loads the OOS R-multiples from the nested WF results JSON and runs:
   - P(end negative), P(max DD > 20R), P(max DD > 30R)
   - Rolling 50-trade win rate and expectancy (temporal stability check)
 
+Live comparison mode:
+  Pass --live_trades N --live_r X to show where a live result falls in
+  the simulated distribution and evaluate it against pass/fail criteria.
+
 Requirements:
   data/derived/runs/walk_forward/nested_wf_results.json must exist and
   contain 'oos_trades'.  Re-run the nested WF to generate it:
@@ -16,7 +20,8 @@ Requirements:
 
 Usage:
   python scripts/monte_carlo.py
-  python scripts/monte_carlo.py --input data/derived/runs/walk_forward/nested_wf_results.json
+  python scripts/monte_carlo.py --live_trades 47 --live_r 3.2
+  python scripts/monte_carlo.py --live_trades 150 --live_r 18.5 --live_wins 51
 """
 from __future__ import annotations
 
@@ -57,11 +62,121 @@ def _bootstrap(rs: np.ndarray, fn, n: int = N_BOOTSTRAP) -> np.ndarray:
     return np.array([fn(rs[row]) for row in idx])
 
 
+# Pass/fail thresholds (XAU_M15_PBT_v1.0, frozen 2026-07-07)
+PASS_FAIL = {
+    "min_trades":          150,
+    "continue_exp_min":    0.00,
+    "continue_avg_r_min":  0.05,
+    "continue_dd_max":     20.0,
+    "investigate_exp_lo": -0.05,
+    "investigate_exp_hi":  0.05,
+    "investigate_wr_min":  0.286,   # breakeven at 2.5R target
+    "stop_exp_min":       -0.10,
+}
+
+
+def _live_verdict(n: int, total_r: float, wins: int | None, mc_eq: np.ndarray) -> None:
+    """Print where a live result sits in the simulated distribution and apply pass/fail."""
+    mean_r = total_r / n if n > 0 else 0.0
+    wr     = wins / n if (wins is not None and n > 0) else None
+
+    sep  = "=" * 76
+    line = "─" * 52
+
+    print(f"\n{sep}")
+    print(f"LIVE RESULT COMPARISON  ({n} trades,  total R = {total_r:+.2f}R)")
+    print(sep)
+
+    # Percentile in MC distribution
+    col_idx = min(n - 1, mc_eq.shape[1] - 1)
+    col     = mc_eq[:, col_idx]
+    pct     = float(np.mean(col <= total_r)) * 100
+
+    p5, p25, p50, p75, p95 = np.percentile(col, [5, 25, 50, 75, 95])
+    print(f"\n  At trade {n}, simulated distribution (from OOS MC paths):")
+    print(f"    5th pct  : {p5:>+7.1f}R")
+    print(f"   25th pct  : {p25:>+7.1f}R")
+    print(f"   50th pct  : {p50:>+7.1f}R  (median)")
+    print(f"   75th pct  : {p75:>+7.1f}R")
+    print(f"   95th pct  : {p95:>+7.1f}R")
+    print(f"\n  Live result : {total_r:>+7.1f}R  ->  {pct:.0f}th percentile of simulated paths")
+
+    if pct < 5:
+        rank = "WELL BELOW NORMAL (bottom 5% of simulated paths)"
+    elif pct < 25:
+        rank = "below median"
+    elif pct < 75:
+        rank = "within normal range (25th–75th pct)"
+    elif pct < 95:
+        rank = "above median"
+    else:
+        rank = "WELL ABOVE NORMAL (top 5% of simulated paths)"
+    print(f"  Classification: {rank}")
+
+    if wr is not None:
+        be = 1 / (1 + 2.5)
+        print(f"\n  Win rate: {wr*100:.1f}%  (breakeven: {be*100:.1f}%,  OOS baseline: 32.5%)")
+
+    # Pass/fail evaluation
+    pf = PASS_FAIL
+    print(f"\n{line}")
+    if n < pf["min_trades"]:
+        print(f"  PASS/FAIL: PENDING  ({n}/{pf['min_trades']} trades — evaluate at {pf['min_trades']})")
+    else:
+        print(f"  PASS/FAIL EVALUATION  (XAU_M15_PBT_v1.0, n={n} >= {pf['min_trades']})")
+        print()
+
+        checks = []
+
+        # Expectancy check
+        if mean_r >= pf["continue_avg_r_min"]:
+            checks.append(("PASS",        f"Expectancy {mean_r:+.4f}R >= {pf['continue_avg_r_min']:+.2f}R"))
+        elif mean_r >= pf["investigate_exp_lo"]:
+            checks.append(("INVESTIGATE", f"Expectancy {mean_r:+.4f}R in unclear zone [{pf['investigate_exp_lo']:+.2f}R, {pf['investigate_exp_hi']:+.2f}R]"))
+        else:
+            checks.append(("STOP",        f"Expectancy {mean_r:+.4f}R < {pf['stop_exp_min']:+.2f}R threshold"))
+
+        # Win rate check (only if wins provided)
+        if wr is not None:
+            if wr >= pf["investigate_wr_min"]:
+                checks.append(("PASS",        f"Win rate {wr*100:.1f}% >= breakeven {pf['investigate_wr_min']*100:.1f}%"))
+            else:
+                checks.append(("INVESTIGATE", f"Win rate {wr*100:.1f}% below breakeven {pf['investigate_wr_min']*100:.1f}%"))
+
+        # Percentile check
+        if pct >= 5:
+            checks.append(("PASS",        f"Result at {pct:.0f}th pct of simulated paths (>= 5th)"))
+        else:
+            checks.append(("INVESTIGATE", f"Result at {pct:.0f}th pct — below P5 of normal range"))
+
+        for status, msg in checks:
+            icon = "OK  " if status == "PASS" else ("!!! " if status == "STOP" else "?   ")
+            print(f"    [{icon}] {status:<11}  {msg}")
+
+        overall = "STOP" if any(s == "STOP" for s, _ in checks) else (
+                  "INVESTIGATE" if any(s == "INVESTIGATE" for s, _ in checks) else "CONTINUE")
+        print(f"\n  OVERALL: {overall}")
+        if overall == "CONTINUE":
+            print("  -> Results consistent with OOS expectations.  Stay the course.")
+        elif overall == "INVESTIGATE":
+            print("  -> Collect more trades before changing anything.  Review execution log.")
+        else:
+            print("  -> Halt new entries.  Review execution quality and regime conditions.")
+
+    print(f"\n{sep}\n")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default=DEFAULT_INPUT)
-    ap.add_argument("--out",   default="data/derived/runs/walk_forward")
-    ap.add_argument("--seed",  type=int, default=42)
+    ap.add_argument("--input",       default=DEFAULT_INPUT)
+    ap.add_argument("--out",         default="data/derived/runs/walk_forward")
+    ap.add_argument("--seed",        type=int,   default=42)
+    ap.add_argument("--live_trades", type=int,   default=None,
+                    help="Number of completed live trades")
+    ap.add_argument("--live_r",      type=float, default=None,
+                    help="Total live R accumulated")
+    ap.add_argument("--live_wins",   type=int,   default=None,
+                    help="Number of winning live trades (optional, for win-rate check)")
     args = ap.parse_args()
 
     data_path = Path(args.input)
@@ -216,6 +331,10 @@ def main() -> None:
     print("  These results are consistent with the OOS Calmar of 5.12 across 800 trades.")
     print("  Robustness caveat: one instrument, one historical sample.")
     print("  Live fills remain the primary forward test.\n")
+
+    # ── Live comparison (optional) ────────────────────────────────────────────
+    if args.live_trades is not None and args.live_r is not None:
+        _live_verdict(args.live_trades, args.live_r, args.live_wins, mc_eq)
 
     # ── Save ─────────────────────────────────────────────────────────────────
     out_dir  = Path(args.out)

@@ -1,5 +1,13 @@
 run_name: "live_xauusd_m15_demo"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Strategy version: XAU_M15_PBT_v1.0   (frozen 2026-07-07)
+#
+# PARAMETERS ARE FROZEN.  Do not change without a documented research reason.
+# Changing params during live validation destroys the ability to evaluate
+# whether the model worked.
+# ─────────────────────────────────────────────────────────────────────────────
+
 mt5:
   login: 5052608241
   password: "8nZs_iTt"
@@ -12,13 +20,14 @@ timeframe: "M15"
 
 strategy:
   name: "pullback_trend"
+  version: "XAU_M15_PBT_v1.0"
   params:
     atr_len: 14
-    atr_max_points: 0        # disable high-vol filter (was blocking too much live)
+    atr_max_points: 0
     sma_len: 80
     adx_min: 18.0
     pullback_atr: 0.30
-    pullback_lookback: 3     # keep default explicit
+    pullback_lookback: 3
     stop_atr: 1.60
     target_r: 2.5
     long_only: true
@@ -29,33 +38,23 @@ block_windows_utc: ["21:55-22:10"]
 execution:
   magic: 5052608241
   comment: "xauusd100_demo"
-
-  # execution / broker tolerance
   slippage_points: 50
   deviation_points: 50
-
-  # spread safety gate (live)
   max_spread_points: 45
-
-  # pending order lifecycle
   pending_expiry_bars: 4
   entry_buffer_points: 2
   convert_to_market_on_breakout: true
-
-  # risk controls
-  risk_usd_per_trade: 15       # half-size for live validation phase ($15 = 1.5% of $1000)
-  daily_loss_limit_usd: 45     # -3R daily stop (scaled with risk)
-  max_trades_per_day: 4        # cap=4 is better than 6 in your test
+  risk_usd_per_trade: 15
+  daily_loss_limit_usd: 45
+  max_trades_per_day: 4
   dry_run: false
-
-  # logging
   heartbeat_sec: 60
   spread_state_reminder_sec: 300
 
 risk:
   account_usd: 1000
   cooldown_bars: 16
-  monthly_loss_limit_r: 5.0   # halt new entries if month is down >5R
+  monthly_loss_limit_r: 5.0
 
 risk_filters:
   trend_quality_gate: true
@@ -68,17 +67,56 @@ risk_filters:
 
 regime_filter:
   enabled: true
-  sma_weeks: 40                # only allow longs when weekly close > 40-week SMA
-  require_slope: true            # AND the 40-week SMA itself must be rising
-  slope_lookback_weeks: 4      # compare SMA now vs SMA 4 weeks ago
+  sma_weeks: 40
+  require_slope: true
+  slope_lookback_weeks: 4
 
 daily_filter:
   enabled: false
   sma_days: 20
 
 backtest:
-  spread_source: "rates"       # use MT5 rates spread column
-  spread_points: 60            # fallback if needed
+  spread_source: "rates"
+  spread_points: 60
   spread_mode: "half"
   intrabar_policy: "conservative"
   warmup_min_bars: 120
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Forward test pass/fail criteria (XAU_M15_PBT_v1.0)
+# Defined before live trading begins.  Evaluate at 150 trades minimum.
+#
+# Staging:
+#   Stage 1 — Demo:       150 trades at $15/trade
+#   Stage 2 — Small live: 50-100 trades at $7.50/trade
+#   Stage 3 — Full size:  $15/trade
+#   Stage 4 — Scale:      $30/trade  (only at new equity high)
+# ─────────────────────────────────────────────────────────────────────────────
+forward_test:
+  version: "XAU_M15_PBT_v1.0"
+  frozen_date: "2026-07-07"
+  min_trades_to_evaluate: 150
+
+  continue_if:
+    expectancy_r_min: 0.00        # mean R/trade >= 0
+    avg_r_min: 0.05               # mean R/trade >= +0.05
+    max_drawdown_r: 20.0          # max DD < 20R
+    execution_slippage_max_r: 0.10  # slippage cost < 0.10R/trade
+
+  investigate_if:
+    expectancy_range_r: [-0.05, 0.05]   # edge unclear, gather more data
+    win_rate_min: 0.28                   # below breakeven at 2.5R target
+
+  stop_if:
+    expectancy_r_min: -0.10       # mean R/trade < -0.10R after 150 trades
+    repeated_execution_failures: true
+
+  expected_oos_distribution:
+    win_rate: 0.325               # from nested WF aggregated OOS
+    mean_r_per_trade: 0.1375
+    p_positive_expectancy: 0.993  # bootstrap, 10k resamples
+    mc_p5_at_200_trades: -11.0    # 5th pct final equity at 200 trades
+    mc_median_at_200_trades: 27.5
+    mc_p95_at_200_trades: 66.0
+    p_end_negative_200_trades: 0.125
+    p_dd_gt_20r_200_trades: 0.317
