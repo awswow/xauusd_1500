@@ -659,8 +659,19 @@ def _run_nested(
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "nested_wf_results.json"
     out_path.write_text(
-        json.dumps({"windows": result["windows"], "agg_oos": result["agg_oos"]},
-                   indent=2, default=str),
+        json.dumps({
+            "windows":         result["windows"],
+            "agg_oos":         result["agg_oos"],
+            "oos_trades": [
+                {
+                    "r":      t["r_multiple"],
+                    "reason": t["exit_reason"],
+                    "entry":  t["entry_time"].isoformat() if t.get("entry_time") else None,
+                    "exit":   t["exit_time"].isoformat()  if t.get("exit_time")  else None,
+                }
+                for t in result["oos_trades"]
+            ],
+        }, indent=2, default=str),
         encoding="utf-8",
     )
     print(f"  Results saved: {out_path}\n")
